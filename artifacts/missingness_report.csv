@@ -1,0 +1,23 @@
+variable,n_total,n_miss,n_obs,pct_miss,tier
+sleep_hrs,52507,33634,18873,64.05622107528521,D: EXCLUDE from primary model (>50%)
+triglycerides,52507,30158,22349,57.43615137029349,D: EXCLUDE from primary model (>50%)
+alcohol_drinks_per_day,52507,18195,34312,34.65252252080675,C: Impute + sensitivity analysis (30-50%)
+total_chol,52507,11204,41303,21.33810729997905,"B: Impute + verify diagnostics (SD ratio, mean shift, KS statistic, correlation preservation)"
+hdl_c,52507,11204,41303,21.33810729997905,"B: Impute + verify diagnostics (SD ratio, mean shift, KS statistic, correlation preservation)"
+hba1c,52507,10553,41954,20.09827261127088,"B: Impute + verify diagnostics (SD ratio, mean shift, KS statistic, correlation preservation)"
+creatinine,52507,6926,45581,13.190622202753918,"B: Impute + verify diagnostics (SD ratio, mean shift, KS statistic, correlation preservation)"
+mean_dbp,52507,6729,45778,12.815434132591843,"B: Impute + verify diagnostics (SD ratio, mean shift, KS statistic, correlation preservation)"
+mean_sbp,52507,6546,45961,12.466909174014894,"B: Impute + verify diagnostics (SD ratio, mean shift, KS statistic, correlation preservation)"
+bmxwaist,52507,6451,46056,12.285980916830137,"B: Impute + verify diagnostics (SD ratio, mean shift, KS statistic, correlation preservation)"
+wbc,52507,6010,46497,11.446092901898794,"B: Impute + verify diagnostics (SD ratio, mean shift, KS statistic, correlation preservation)"
+pir,52507,5430,47077,10.341478279086598,"B: Impute + verify diagnostics (SD ratio, mean shift, KS statistic, correlation preservation)"
+htn_med,52507,5111,47396,9.73394023653989,"B: Impute + verify diagnostics (SD ratio, mean shift, KS statistic, correlation preservation)"
+bmxbmi,52507,4341,48166,8.26746909935818,"B: Impute + verify diagnostics (SD ratio, mean shift, KS statistic, correlation preservation)"
+chd_sr,52507,211,52296,0.40185118174719564,A: Impute freely (<5%)
+education,52507,96,52411,0.18283276515512217,A: Impute freely (<5%)
+smoking,52507,64,52443,0.1218885101034148,A: Impute freely (<5%)
+diabetes_sr,52507,34,52473,0.0647532709924391,A: Impute freely (<5%)
+phys_active,52507,6,52501,0.011427047822195136,A: Impute freely (<5%)
+race_eth,52507,0,52507,0.0,A: Impute freely (<5%)
+sex,52507,0,52507,0.0,A: Impute freely (<5%)
+age,52507,0,52507,0.0,A: Impute freely (<5%)

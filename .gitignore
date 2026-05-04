@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# files
+artifacts_old/
+supplementary_figs/
+main_figs/
+
+
+# Ignore the top-level models folder
+models/*
+
+# Allow the 'final' folder
+!models/final/
+
+# RE-IGNORE any folder named 'models' inside 'final' at any depth
+models/final/**/models/

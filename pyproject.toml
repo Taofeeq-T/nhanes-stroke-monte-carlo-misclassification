@@ -1,0 +1,18 @@
+[project]
+name = "keith610"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "autogluon>=1.2",
+    "hyperimpute>=0.1.17",
+    "matplotlib>=3.10.8",
+    "numpy<2.0.0",
+    "pandas<2.3.0",
+    "pyarrow<17.0.0",
+    "scikit-learn==1.5.2",
+    "scipy<1.13.0",
+    "seaborn>=0.13.2",
+    "shap>=0.49.1",
+]
