@@ -1,6 +1,13 @@
 """
 ================================================================================
 NHANES Stroke Prediction — HyperImpute Imputation Pipeline
+
+NOTE (revision): This script now serves DESCRIPTIVE purposes only
+(missingness report, tier assignment, missingness-mechanism tests, and
+imputation quality diagnostics for Figure 1 / Supplementary Table S2).
+The imputed dataset it writes is NOT used for modeling. Imputation for all
+models is performed inside autogluon_modeling.py via fold_imputation.py,
+fitted on training rows only within each CV fold and for the final model.
 ================================================================================
 Codebook-driven variable roles + full diagnostic chain.
 
@@ -33,6 +40,47 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
+
+# --- Log console output to logs/stage5_hyperimpute.log (for review bundle) ---
+import sys as _sys
+from pathlib import Path as _Path
+
+
+import re as _re
+
+_WARN = _re.compile(r"FutureWarning|ConvergenceWarning|DeprecationWarning|UserWarning|"
+                    r"RuntimeWarning|^\s*warnings\.warn\(|site-packages.*\.py:\d+")
+
+
+class _Tee:
+    """Console output is unchanged; the log file drops library warning lines."""
+
+    def __init__(self, console, logfile):
+        self.console, self.logfile, self._buf = console, logfile, ""
+
+    def write(self, data):
+        self.console.write(data)
+        self._buf += data
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if not _WARN.search(line):
+                self.logfile.write(line + "\n")
+        self.console.flush()
+        self.logfile.flush()
+
+    def flush(self):
+        self.console.flush()
+        self.logfile.flush()
+
+    def __getattr__(self, name):          # fileno(), isatty(), encoding, etc.
+        return getattr(self.console, name)
+
+
+_log_dir = _Path(__file__).resolve().parent.parent / "logs"
+_log_dir.mkdir(exist_ok=True)
+_log_file = open(_log_dir / "stage5_hyperimpute.log", "w")
+_sys.stdout = _Tee(_sys.__stdout__, _log_file)
+_sys.stderr = _Tee(_sys.__stderr__, _log_file)
 warnings.filterwarnings("ignore")
 
 
@@ -85,6 +133,18 @@ df = pd.read_csv(data_path)
 codebook_path = artifacts_dir / "variable_codebook.csv"
 codebook = pd.read_csv(codebook_path)
 
+# --- Restrict to the TRAINING rows (80%) of the modeling split ---
+# Tiers, missingness-mechanism tests, and imputation diagnostics are all
+# computed on training rows only; the holdout set is never inspected here.
+import sys
+sys.path.insert(0, str(script_dir))
+from fold_imputation import make_holdout_split, impute_split
+
+df_full = df
+train_pos, holdout_pos = make_holdout_split(df_full)
+df = df_full.iloc[train_pos].copy()
+print(f"Using training rows only: {len(df):,} of {len(df_full):,}")
+
 print(f"Loaded: {df.shape[0]:,} rows x {df.shape[1]} columns")
 print(f"Stroke cases: {df['stroke'].sum():,} ({df['stroke'].mean()*100:.1f}%)")
 print(f"Cycles: {sorted(df['year'].unique())}")
@@ -100,7 +160,7 @@ print("=" * 70)
 
 # Administrative variables (never imputed)
 id_vars = ["seqn", "year"]
-design_vars = ["sdmvpsu", "sdmvstra", "wtmec2yr", "wtint2yr"]
+design_vars = ["sdmvpsu", "sdmvstra", "wtmec2yr", "wtint2yr", "wtph2yr", "wt_pooled"]
 outcome_var = "stroke"
 
 # Filter codebook to predictors only
@@ -174,7 +234,7 @@ for var in all_predictors:
         contingency = pd.crosstab(miss_indicator, df["stroke"])
         if contingency.shape == (2, 2):
             chi2, p, _, _ = stats.chi2_contingency(contingency)
-            mechanism = "MAR/MNAR likely" if p < 0.05 else "MCAR plausible"
+            mechanism = "associated with outcome" if p < 0.05 else "no association detected"
             flag = " ***" if p < 0.05 else ""
             print(f"  {var:<28s} {chi2:8.2f} {p:10.4f}   {mechanism}{flag}")
             mechanism_results.append({
@@ -184,8 +244,7 @@ for var in all_predictors:
         print(f"  {var:<28s} {'—':>8s} {'—':>10s}   No missingness")
 
 print("\n  *** = p < 0.05 (missingness is differential by stroke status)")
-print("  Variables with MAR/MNAR: imputation justified over complete-case analysis")
-print("  Variables with MCAR: imputation still valid, complete-case also unbiased")
+print("  Note: this test cannot distinguish MAR from MNAR, and p >= 0.05 does not establish MCAR.")
 
 # ==============================================================================
 # 4. TIERED EXCLUSION (DATA-DRIVEN)
@@ -318,81 +377,14 @@ print("\n" + "=" * 70)
 print("STEP 6: Run HyperImpute")
 print("=" * 70)
 
-from hyperimpute.plugins.imputers import Imputers
-
-# HyperImpute: column-wise model selection from a library of learners.
-# For each column, it evaluates logistic/linear regression, random forest,
-# and CatBoost via cross-validation, selecting the best imputer per feature.
-# This adapts to the structure of each variable's missingness pattern.
-#
-# NOTE: CatBoost is used instead of XGBoost because macOS Apple Silicon
-# loads multiple conflicting copies of libomp (from Homebrew, sklearn, and
-# PyTorch), causing segfaults in XGBoost's OpenMP threading. CatBoost is
-# self-contained and avoids this issue. Both are gradient boosting methods
-# with comparable imputation quality on tabular data.
-
-print("\nInitializing HyperImpute with column-wise model selection...")
-print("This may take 10-30 minutes depending on dataset size.\n")
-
-# Three diverse learner classes for column-wise model selection:
-#   - Linear models (logistic_regression / linear_regression)
-#   - Tree ensemble (random_forest / random_forest_regressor)
-#   - Gradient boosting (catboost / catboost_regressor)
-# CatBoost used instead of XGBoost to avoid OpenMP multi-library crash on macOS.
-# sklearn pinned to ==1.5.2 to avoid deprecated `multi_class` parameter bug.
-imputer = Imputers().get(
-    "hyperimpute",
-    optimizer="hyperband",
-    classifier_seed=["logistic_regression", "random_forest", "catboost"],
-    regression_seed=["linear_regression", "random_forest_regressor", "catboost_regressor"],
-    random_state=RANDOM_SEED,
+# Final-model imputation: fitted on training rows only and applied to the
+# holdout rows. Cached so autogluon_modeling.py reuses exactly this fit.
+# Output is already post-processed (decoded, range-clipped, binary-rounded).
+df_imputed, _ = impute_split(
+    df_full.iloc[train_pos], df_full.iloc[holdout_pos], codebook, vars_to_impute,
+    cache_dir=data_dir / "imputed_folds", tag="primary_final",
 )
-
-print("Fitting HyperImpute...")
-df_imputed_values = imputer.fit_transform(df_impute.copy())
-df_imputed = pd.DataFrame(df_imputed_values, columns=df_impute.columns, index=df_impute.index)
-
-print(f"\nImputation complete.")
-print(f"Remaining missing values: {df_imputed.isna().sum().sum()}")
-
-# ==============================================================================
-# 7. POST-IMPUTATION PROCESSING
-# ==============================================================================
-
-print("\n" + "=" * 70)
-print("STEP 7: Post-imputation processing")
-print("=" * 70)
-
-# --- Decode categorical variables back to labels ---
-for col, categories in cat_mappings.items():
-    if col in df_imputed.columns:
-        df_imputed[col] = df_imputed[col].round().clip(0, len(categories) - 1).astype(int)
-        df_imputed[col] = df_imputed[col].map(dict(enumerate(categories)))
-        print(f"  Decoded {col}: {df_imputed[col].value_counts().to_dict()}")
-
-# --- Enforce plausible clinical ranges ---
-# Imputation can produce out-of-range values; clip to biologically plausible bounds.
-# BP zeroes were already converted to NA in the R extraction script.
-range_constraints = {
-    "age": (20, 80), "mean_sbp": (70, 250), "mean_dbp": (40, 150),
-    "bmxwaist": (50, 200), "bmxbmi": (12, 80),
-    "alcohol_drinks_per_day": (0, 20),
-    "hba1c": (3, 18), "total_chol": (80, 500), "hdl_c": (10, 150),
-    "triglycerides": (20, 2000), "creatinine": (0.1, 15), "wbc": (1, 50),
-    "pir": (0, 5), "sleep_hrs": (1, 18),
-}
-
-for col, (lo, hi) in range_constraints.items():
-    if col in df_imputed.columns:
-        n_clipped = ((df_imputed[col] < lo) | (df_imputed[col] > hi)).sum()
-        if n_clipped > 0:
-            print(f"  Clipped {n_clipped} out-of-range values in {col} to [{lo}, {hi}]")
-        df_imputed[col] = df_imputed[col].clip(lo, hi)
-
-# --- Round binary variables to 0/1 ---
-for col in binary_predictors:
-    if col in df_imputed.columns:
-        df_imputed[col] = df_imputed[col].round().clip(0, 1).astype(int)
+print(f"Imputation complete. Remaining missing values: {df_imputed.isna().sum().sum()}")
 
 # ==============================================================================
 # 8. IMPUTATION QUALITY DIAGNOSTICS
@@ -563,9 +555,7 @@ print(f"Remaining NAs in imputed predictors: {df_final[vars_to_impute].isna().su
 # ==============================================================================
 
 # Imputed dataset
-df_final.to_parquet(data_dir / "nhanes_stroke_imputed_2003_2023.parquet", index=False)
-df_final.to_csv(data_dir / "nhanes_stroke_imputed_2003_2023.csv", index=False)
-print(f"\nExported: nhanes_stroke_imputed_2003_2023.parquet / .csv")
+# (No imputed dataset is exported. Modeling imputes within each fold.)
 
 # Missingness report with tier decisions
 miss_report.to_csv(artifacts_dir / "missingness_report.csv", index=False)

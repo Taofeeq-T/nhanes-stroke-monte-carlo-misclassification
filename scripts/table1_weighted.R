@@ -4,6 +4,39 @@
 
 # install.packages(c("tableone", "survey", "nhanesdata", "e1071"))
 
+# --- Resolve the repository root (works from RStudio or Rscript) ---
+.script_path <- function() {
+  a <- commandArgs(trailingOnly = FALSE)
+  f <- sub("^--file=", "", a[grep("^--file=", a)])
+  if (length(f)) return(normalizePath(f[1]))
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    p <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) "")
+    if (nzchar(p)) return(normalizePath(p))
+  }
+  ""
+}
+.repo_root <- function() {
+  sp <- .script_path()
+  if (nzchar(sp)) return(dirname(dirname(sp)))     # scripts/<file>.R -> repo root
+  p <- normalizePath(getwd())
+  while (!dir.exists(file.path(p, "scripts")) && dirname(p) != p) p <- dirname(p)
+  p
+}
+setwd(.repo_root())
+if (!dir.exists("scripts")) {
+  stop("Could not find the repository root. Run setwd(\"/path/to/nhanes-stroke-monte-carlo-misclassification\") first.")
+}
+cat("Working directory:", getwd(), "\n")
+dir.create("artifacts", showWarnings = FALSE)
+dir.create("data", showWarnings = FALSE)
+dir.create("logs", showWarnings = FALSE)
+
+# --- Log console output to logs/stage2_table1.log (for review bundle) ---
+dir.create("logs", showWarnings = FALSE)
+.log_con <- file("logs/stage2_table1.log", open = "wt")
+sink(.log_con, split = TRUE)
+
+
 library(tableone)
 library(survey)
 library(nhanesdata)
@@ -63,13 +96,11 @@ if ("race_eth" %in% names(analytic)) {
 analytic$stroke <- factor(analytic$stroke, levels = c(0, 1),
                           labels = c("No Stroke", "Stroke"))
 
-# Build survey design (MEC weights)
-nhanes_design <- create_design(
-  dsn      = analytic,
-  start_yr = min(analytic$year),
-  end_yr   = max(analytic$year),
-  wt_type  = "mec"
-)
+# Build survey design: pooled weight (WTMEC2YR for 2003-2018, WTPH2YR for
+# 2021-2023) divided by the number of cycles; PSUs nested within strata.
+options(survey.lonely.psu = "adjust")
+nhanes_design <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wt_pooled,
+                           nest = TRUE, data = analytic)
 
 options(survey.lonely.psu = "adjust")
 
@@ -107,3 +138,6 @@ tab1_csv <- print(tab1,
 
 write.csv(tab1_csv, "artifacts/table1_weighted_final.csv")
 cat("\nSuccess: table1_weighted_final.csv saved.\n")
+
+sink()
+close(.log_con)

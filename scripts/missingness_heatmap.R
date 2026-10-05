@@ -3,6 +3,39 @@
 # Produces a variable × cycle heatmap of missingness rates
 ################################################################################
 
+# --- Resolve the repository root (works from RStudio or Rscript) ---
+.script_path <- function() {
+  a <- commandArgs(trailingOnly = FALSE)
+  f <- sub("^--file=", "", a[grep("^--file=", a)])
+  if (length(f)) return(normalizePath(f[1]))
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    p <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) "")
+    if (nzchar(p)) return(normalizePath(p))
+  }
+  ""
+}
+.repo_root <- function() {
+  sp <- .script_path()
+  if (nzchar(sp)) return(dirname(dirname(sp)))     # scripts/<file>.R -> repo root
+  p <- normalizePath(getwd())
+  while (!dir.exists(file.path(p, "scripts")) && dirname(p) != p) p <- dirname(p)
+  p
+}
+setwd(.repo_root())
+if (!dir.exists("scripts")) {
+  stop("Could not find the repository root. Run setwd(\"/path/to/nhanes-stroke-monte-carlo-misclassification\") first.")
+}
+cat("Working directory:", getwd(), "\n")
+dir.create("artifacts", showWarnings = FALSE)
+dir.create("data", showWarnings = FALSE)
+dir.create("logs", showWarnings = FALSE)
+
+# --- Log console output to logs/stage3_heatmap.log (for review bundle) ---
+dir.create("logs", showWarnings = FALSE)
+.log_con <- file("logs/stage3_heatmap.log", open = "wt")
+sink(.log_con, split = TRUE)
+
+
 library(systemfonts)  
 library(textshaping)
 library(ragg)
@@ -115,7 +148,8 @@ p <- ggplot(miss_by_cycle, aes(x = factor(year), y = display_name, fill = pct_mi
     subtitle = "Decision Tiers: A (<5%) impute freely | B (5-30%) impute + verify diagnostics | C (30-50%) sensitivity analysis | D (>50%) exclude",
     x = "NHANES Cycle (Start Year)",
     y = NULL,
-    caption = "Source: NHANES 2003-2023 via nhanesdata R package. N reflects adults >=20 with valid stroke response."
+    caption = paste0("NHANES 2003-2023 (nhanesdata R package); n = ",
+                     format(nrow(analytic), big.mark = ","), ".")
   ) +
   
   theme_minimal(base_size = 11) +
@@ -157,3 +191,6 @@ overall_miss <- analytic |>
 write.csv(overall_miss, "artifacts/missingness_tier_classification.csv", row.names = FALSE)
 
 cat("Success! Heatmap and Tier CSV are saved.\n")
+
+sink()
+close(.log_con)

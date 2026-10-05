@@ -9,11 +9,29 @@ wheels/
 # Virtual environments
 .venv
 
-# files
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Environment and secrets
+.env
+
+# Local working folders
 artifacts_old/
 supplementary_figs/
 main_figs/
 
+# Regenerated intermediate files (fold-wise imputations, run logs)
+data/imputed_folds/
+logs/
 
 # Ignore the top-level models folder
 models/*

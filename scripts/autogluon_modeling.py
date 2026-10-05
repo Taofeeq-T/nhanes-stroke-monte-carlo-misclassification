@@ -33,10 +33,131 @@ from scipy import stats
 import warnings
 warnings.filterwarnings("ignore")
 
+# --- Log console output to logs/stage6_modeling.log (for review bundle) ---
+import sys as _sys
+from pathlib import Path as _Path
+
+
+import re as _re
+
+_WARN = _re.compile(r"FutureWarning|ConvergenceWarning|DeprecationWarning|UserWarning|"
+                    r"RuntimeWarning|^\s*warnings\.warn\(|site-packages.*\.py:\d+")
+
+
+class _Tee:
+    """Console output is unchanged; the log file drops library warning lines."""
+
+    def __init__(self, console, logfile):
+        self.console, self.logfile, self._buf = console, logfile, ""
+
+    def write(self, data):
+        self.console.write(data)
+        self._buf += data
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if not _WARN.search(line):
+                self.logfile.write(line + "\n")
+        self.console.flush()
+        self.logfile.flush()
+
+    def flush(self):
+        self.console.flush()
+        self.logfile.flush()
+
+    def __getattr__(self, name):          # fileno(), isatty(), encoding, etc.
+        return getattr(self.console, name)
+
+
+_log_dir = _Path(__file__).resolve().parent.parent / "logs"
+_log_dir.mkdir(exist_ok=True)
+_log_file = open(_log_dir / "stage6_modeling.log", "w")
+_sys.stdout = _Tee(_sys.__stdout__, _log_file)
+_sys.stderr = _Tee(_sys.__stderr__, _log_file)
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.metrics import roc_curve
+
+
+def youden_threshold(y, p):
+    """Threshold maximizing Youden's J on (y, p)."""
+    fpr, tpr, thr = roc_curve(y, p)
+    return float(thr[np.argmax(tpr - fpr)])
+
+
+def threshold_metrics(y, p, thr):
+    yhat = (p >= thr).astype(int)
+    tp = int(np.sum((yhat == 1) & (y == 1))); fn = int(np.sum((yhat == 0) & (y == 1)))
+    tn = int(np.sum((yhat == 0) & (y == 0))); fp = int(np.sum((yhat == 1) & (y == 0)))
+    se = tp / max(tp + fn, 1); sp = tn / max(tn + fp, 1); ppv = tp / max(tp + fp, 1)
+    return {"threshold": thr, "balanced_accuracy": (se + sp) / 2,
+            "f1": 2 * ppv * se / max(ppv + se, 1e-12), "sensitivity": se,
+            "specificity": sp, "ppv": ppv, "tp": tp, "fn": fn, "tn": tn, "fp": fp}
+
+
+def logistic_reference():
+    """Unpenalized-in-practice logistic regression reference (one-hot + scaling)."""
+    return make_pipeline(StandardScaler(), LogisticRegression(C=1e4, max_iter=5000))
+
+
+def one_hot(X, columns=None):
+    Xd = pd.get_dummies(X, drop_first=True, dtype=float)
+    return Xd if columns is None else Xd.reindex(columns=columns, fill_value=0.0)
+
+
+def autogluon_oof_proba(pred, model=None):
+    """Out-of-fold P(stroke) on the predictor's own training data, if available."""
+    for fn in ("predict_proba_oof", "get_oof_pred_proba"):
+        if hasattr(pred, fn):
+            try:
+                out = getattr(pred, fn)(model=model) if model else getattr(pred, fn)()
+                return np.asarray(out[1] if hasattr(out, "columns") else out)
+            except Exception:
+                continue
+    return None
+
+
+def calibration_intercept_slope(y, p, eps=1e-6):
+    """Calibration-in-the-large (intercept with slope fixed at 1) and calibration slope."""
+    from scipy.optimize import brentq
+    from scipy.special import expit
+    lp = np.log(np.clip(p, eps, 1 - eps) / (1 - np.clip(p, eps, 1 - eps)))
+    a = brentq(lambda a: np.sum(y - expit(a + lp)), -20, 20)
+    slope = LogisticRegression(C=1e6, max_iter=5000).fit(lp.reshape(-1, 1), y).coef_[0, 0]
+    return a, slope
+
+
+def holdout_metrics(y, p, thr):
+    ci, cs = calibration_intercept_slope(y, p)
+    tm = threshold_metrics(y, p, thr)
+    return {"auroc": roc_auc_score(y, p), "auprc": average_precision_score(y, p),
+            "brier_score": brier_score_loss(y, p), "calibration_intercept": ci,
+            "calibration_slope": cs, "balanced_accuracy": tm["balanced_accuracy"],
+            "f1": tm["f1"], "sensitivity": tm["sensitivity"],
+            "specificity": tm["specificity"], "ppv": tm["ppv"]}
+
+
+def bootstrap_ci(y, p, thr, n_boot=1000, seed=42):
+    """Point estimates and 95% CIs from a bootstrap stratified by outcome."""
+    rng = np.random.default_rng(seed)
+    pos, neg = np.where(y == 1)[0], np.where(y == 0)[0]
+    point = holdout_metrics(y, p, thr)
+    boots = []
+    for _ in range(n_boot):
+        idx = np.r_[rng.choice(pos, len(pos)), rng.choice(neg, len(neg))]
+        boots.append(holdout_metrics(y[idx], p[idx], thr))
+    b = pd.DataFrame(boots)
+    return pd.DataFrame({"metric": list(point), "estimate": list(point.values()),
+                         "ci_lower": [b[m].quantile(0.025) for m in point],
+                         "ci_upper": [b[m].quantile(0.975) for m in point]})
+
 
 # Publication-quality figure defaults
 plt.rcParams.update({
@@ -94,13 +215,21 @@ print("=" * 70)
 print("STEP 1: Load imputed data")
 print("=" * 70)
 
-df = pd.read_csv(data_dir / "nhanes_stroke_imputed_2003_2023.csv")
+# Load the PRE-imputation analytic dataset. Imputation is performed inside the
+# modeling loop, fitted on training rows only (see fold_imputation.py).
+df = pd.read_csv(data_dir / "nhanes_stroke_analytic_2003_2023.csv")
 codebook = pd.read_csv(artifacts_dir / "variable_codebook.csv")
 miss_report = pd.read_csv(artifacts_dir / "missingness_report.csv")
 
 # Identify Tier D (excluded) and Tier C (sensitivity analysis) variables
 tier_d_vars = miss_report[miss_report["tier"].str.startswith("D")]["variable"].tolist()
 tier_c_vars = miss_report[miss_report["tier"].str.startswith("C")]["variable"].tolist()
+# Alcohol was pre-specified for the exclusion sensitivity analysis. After the
+# cohort restriction its missingness sits near the 30% Tier B/C boundary, so it
+# is kept in the sensitivity analysis regardless of tier. Set to [] to make the
+# sensitivity analysis purely tier-driven.
+FORCE_SENSITIVITY_VARS = []
+tier_c_vars = sorted(set(tier_c_vars) | set(FORCE_SENSITIVITY_VARS))
 
 print(f"Loaded: {df.shape[0]:,} rows x {df.shape[1]} columns")
 print(f"Stroke prevalence: {df['stroke'].mean()*100:.1f}% ({df['stroke'].sum():,} cases)")
@@ -117,7 +246,7 @@ print("=" * 70)
 
 # All predictors except IDs, weights, outcome, and Tier D
 exclude_cols = ["seqn", "year", "sdmvpsu", "sdmvstra", "wtmec2yr",
-                "wtint2yr", "stroke"] + tier_d_vars
+                "wtint2yr", "wtph2yr", "wt_pooled", "stroke"] + tier_d_vars
 
 feature_cols = [c for c in df.columns if c not in exclude_cols]
 
@@ -139,6 +268,9 @@ print("=" * 70)
 
 from autogluon.tabular import TabularPredictor
 from sklearn.model_selection import train_test_split
+from fold_imputation import impute_split
+
+IMPUTE_CACHE = data_dir / "imputed_folds"   # cached fold-wise imputations
 
 TOTAL_FOLDS = N_SPLITS * N_REPEATS
 
@@ -148,7 +280,7 @@ y = df["stroke"]
 # --- 80/20 stratified holdout split ---
 # The holdout set is NEVER seen during CV training or model selection.
 # It provides the final unbiased performance estimate for the paper.
-X_train_cv, X_holdout, y_train_cv, y_holdout = train_test_split(
+X_train_cv_raw, X_holdout_raw, y_train_cv, y_holdout = train_test_split(
     X, y,
     test_size=HOLDOUT_FRAC,
     stratify=y,
@@ -156,9 +288,9 @@ X_train_cv, X_holdout, y_train_cv, y_holdout = train_test_split(
 )
 
 print(f"\nHoldout split:")
-print(f"  Training (CV):  {len(X_train_cv):,} rows ({y_train_cv.sum():,} stroke, "
+print(f"  Training (CV):  {len(X_train_cv_raw):,} rows ({y_train_cv.sum():,} stroke, "
       f"{y_train_cv.mean()*100:.1f}%)")
-print(f"  Holdout (test): {len(X_holdout):,} rows ({y_holdout.sum():,} stroke, "
+print(f"  Holdout (test): {len(X_holdout_raw):,} rows ({y_holdout.sum():,} stroke, "
       f"{y_holdout.mean()*100:.1f}%)")
 
 print(f"\nCV strategy: {N_SPLITS}-fold × {N_REPEATS} repeats = {TOTAL_FOLDS} fits")
@@ -178,12 +310,19 @@ best_auroc = -1
 
 print(f"\nTraining AutoGluon across {TOTAL_FOLDS} folds (on training set only)...\n")
 
-for fold_idx, (train_idx, test_idx) in enumerate(rskf.split(X_train_cv, y_train_cv)):
+for fold_idx, (train_idx, test_idx) in enumerate(rskf.split(X_train_cv_raw, y_train_cv)):
     print(f"--- Fold {fold_idx + 1}/{TOTAL_FOLDS} ---")
 
+    # Fold-wise imputation: HyperImpute fitted on the fold's training rows only,
+    # then applied to the fold's validation rows.
+    X_tr_imp, X_te_imp = impute_split(
+        X_train_cv_raw.iloc[train_idx], X_train_cv_raw.iloc[test_idx],
+        codebook, feature_cols, cache_dir=IMPUTE_CACHE, tag=f"primary_fold{fold_idx}",
+    )
+
     # Prepare train/test DataFrames with label column
-    train_data = pd.concat([X_train_cv.iloc[train_idx], y_train_cv.iloc[train_idx]], axis=1)
-    test_data = pd.concat([X_train_cv.iloc[test_idx], y_train_cv.iloc[test_idx]], axis=1)
+    train_data = pd.concat([X_tr_imp, y_train_cv.iloc[train_idx]], axis=1)
+    test_data = pd.concat([X_te_imp, y_train_cv.iloc[test_idx]], axis=1)
 
     # Train AutoGluon
     predictor = TabularPredictor(
@@ -207,12 +346,28 @@ for fold_idx, (train_idx, test_idx) in enumerate(rskf.split(X_train_cv, y_train_
     y_true = test_data["stroke"].values
     y_pred = (y_pred_proba_pos >= 0.5).astype(int)
 
-    # Compute metrics
+    # Compute metrics (threshold-dependent metrics at 0.50 kept for transparency)
     auroc = roc_auc_score(y_true, y_pred_proba_pos)
     bal_acc = balanced_accuracy_score(y_true, y_pred)
     auprc = average_precision_score(y_true, y_pred_proba_pos)
     brier = brier_score_loss(y_true, y_pred_proba_pos)
     f1 = f1_score(y_true, y_pred)
+
+    # Threshold learned from the fold's TRAINING data only (Youden's J on
+    # AutoGluon's out-of-fold predictions for the training rows), then applied
+    # to the fold's validation rows. NaN if OOF predictions are unavailable.
+    oof_tr = autogluon_oof_proba(predictor)
+    if oof_tr is not None and len(oof_tr) == len(train_idx):
+        fold_thr = youden_threshold(y_train_cv.iloc[train_idx].values, oof_tr)
+        tm = threshold_metrics(y_true, y_pred_proba_pos, fold_thr)
+    else:
+        tm = {k: np.nan for k in ["threshold", "balanced_accuracy", "f1", "sensitivity",
+                                  "specificity", "ppv"]}
+
+    # Logistic regression reference on the same imputed fold data
+    Xtr_lr = one_hot(X_tr_imp); Xte_lr = one_hot(X_te_imp, Xtr_lr.columns)
+    lr = logistic_reference().fit(Xtr_lr, y_train_cv.iloc[train_idx].values)
+    p_lr = lr.predict_proba(Xte_lr)[:, 1]
 
     cv_results.append({
         "fold": fold_idx + 1,
@@ -221,6 +376,14 @@ for fold_idx, (train_idx, test_idx) in enumerate(rskf.split(X_train_cv, y_train_
         "f1": f1,
         "auprc": auprc,
         "brier_score": brier,
+        "train_threshold": tm["threshold"],
+        "balanced_accuracy_train_thr": tm["balanced_accuracy"],
+        "f1_train_thr": tm["f1"],
+        "sensitivity_train_thr": tm["sensitivity"],
+        "specificity_train_thr": tm["specificity"],
+        "ppv_train_thr": tm["ppv"],
+        "lr_auroc": roc_auc_score(y_true, p_lr),
+        "lr_auprc": average_precision_score(y_true, p_lr),
         "n_train": len(train_idx),
         "n_test": len(test_idx),
         "n_stroke_test": y_true.sum(),
@@ -265,7 +428,10 @@ cv_df = pd.DataFrame(cv_results)
 print(f"\nPerformance across {TOTAL_FOLDS} folds:")
 print(f"  {'Metric':<25s} {'Mean':>8s} {'SD':>8s} {'Min':>8s} {'Max':>8s}")
 print("  " + "-" * 55)
-for metric in ["auroc", "balanced_accuracy", "f1", "auprc", "brier_score"]:
+for metric in ["auroc", "auprc", "brier_score", "balanced_accuracy", "f1",
+               "train_threshold", "balanced_accuracy_train_thr", "f1_train_thr",
+               "sensitivity_train_thr", "specificity_train_thr", "ppv_train_thr",
+               "lr_auroc", "lr_auprc"]:
     vals = cv_df[metric]
     print(f"  {metric:<25s} {vals.mean():8.4f} {vals.std():8.4f} {vals.min():8.4f} {vals.max():8.4f}")
 
@@ -289,6 +455,13 @@ print("=" * 70)
 
 # Retrain the best model on the FULL training set (all CV data)
 # then evaluate on the holdout set that was never seen during CV.
+# Imputation for the final model: fitted on the full 80% training set only,
+# then applied to the sequestered holdout set.
+X_train_cv, X_holdout = impute_split(
+    X_train_cv_raw, X_holdout_raw, codebook, feature_cols,
+    cache_dir=IMPUTE_CACHE, tag="primary_final",
+)
+
 print(f"\nRetraining best model on full training set ({len(X_train_cv):,} rows)...")
 
 train_data_full = pd.concat([X_train_cv, y_train_cv], axis=1)
@@ -310,6 +483,24 @@ predictor_final.fit(
 
 # Predict on holdout
 y_holdout_proba = predictor_final.predict_proba(X_holdout)[1].values
+
+# Record AutoGluon configuration relevant to class imbalance and thresholds.
+# All reported metrics use predict_proba() with explicit thresholds (0.50 or the
+# Youden threshold from CV OOF predictions); AutoGluon's internal decision
+# threshold (if calibrated) is recorded here but NOT used for any reported metric.
+import json
+ag_config = {
+    "eval_metric": "balanced_accuracy",
+    "presets": PRESETS,
+    "sample_weight": str(getattr(predictor_final, "sample_weight", None)),
+    "internal_decision_threshold": getattr(predictor_final, "decision_threshold", None),
+    "class_weights_or_resampling": "none specified (AutoGluon defaults)",
+    "autogluon_version": __import__("autogluon.tabular").__version__
+        if hasattr(__import__("autogluon.tabular"), "__version__") else None,
+}
+with open(artifacts_dir / "autogluon_config.json", "w") as f:
+    json.dump(ag_config, f, indent=2, default=str)
+print(f"AutoGluon config: {ag_config}")
 y_holdout_pred = (y_holdout_proba >= 0.5).astype(int)
 y_holdout_true = y_holdout.values
 
@@ -403,29 +594,83 @@ holdout_preds_df = pd.DataFrame({
 })
 holdout_preds_df.to_csv(artifacts_dir / "holdout_predictions.csv", index=False)
 
+# 95% CIs for holdout metrics (stratified bootstrap, 1,000 resamples).
+# Threshold-dependent metrics at 0.50 and at the Youden threshold.
+ci_050 = bootstrap_ci(y_holdout_true, y_holdout_proba, 0.5).assign(threshold="0.50")
+ci_yj = bootstrap_ci(y_holdout_true, y_holdout_proba, optimal_threshold).assign(threshold="youden")
+holdout_ci = pd.concat([ci_050, ci_yj])
+holdout_ci.to_csv(artifacts_dir / "holdout_metrics_ci.csv", index=False)
+print("\nHoldout metrics with 95% CIs:")
+print(holdout_ci.round(3).to_string(index=False))
+
+# ------------------------------------------------------------------------------
+# Holdout discrimination by measurement period (Reviewer comment 6)
+# BP: auscultatory 2003-2016 vs oscillometric 2017-2023.
+# Physical activity: PAQ leisure-time items 2003-2006, GPAQ recreational items
+# 2007-2018, leisure-time frequency/duration items 2021-2023.
+# 95% CIs from 1,000 stratified bootstrap resamples of holdout participants.
+# ------------------------------------------------------------------------------
+hold_year = df.loc[X_holdout_raw.index, "year"].values
+periods = {
+    "BP auscultatory (2003-2016)":   hold_year < 2017,
+    "BP oscillometric (2017-2023)":  hold_year >= 2017,
+    "PA instrument 2003-2006":       hold_year <= 2005,
+    "PA instrument 2007-2018":       (hold_year >= 2007) & (hold_year <= 2017),
+    "PA instrument 2021-2023":       hold_year >= 2021,
+}
+for cyc in sorted(np.unique(hold_year)):                  # per-cycle holdout AUROC
+    periods[f"Cycle {cyc}-{cyc + 1 if cyc < 2021 else 2023}"] = hold_year == cyc
+rng_p = np.random.default_rng(RANDOM_SEED)
+period_rows = []
+for name, m in periods.items():
+    yt, yp = y_holdout_true[m], y_holdout_proba[m]
+    if yt.sum() < 5:
+        continue
+    pos, neg = np.where(yt == 1)[0], np.where(yt == 0)[0]
+    boots = []
+    for _ in range(1000):
+        idx = np.r_[rng_p.choice(pos, len(pos)), rng_p.choice(neg, len(neg))]
+        boots.append(roc_auc_score(yt[idx], yp[idx]))
+    lo, hi = np.percentile(boots, [2.5, 97.5])
+    period_rows.append({"period": name, "n": int(m.sum()), "n_stroke": int(yt.sum()),
+                        "auroc": roc_auc_score(yt, yp), "ci_lower": lo, "ci_upper": hi})
+period_df = pd.DataFrame(period_rows)
+period_df.to_csv(artifacts_dir / "holdout_auroc_by_measurement_period.csv", index=False)
+print("\nHoldout AUROC by measurement period:")
+print(period_df.round(3).to_string(index=False))
+
 # --- Calibration curve (reliability diagram) ---
-# For clinical utility, predicted probabilities should match observed rates.
-# A well-calibrated model means "10% predicted risk" ≈ 10% actual stroke rate.
-from sklearn.calibration import calibration_curve
+# Against the OBSERVED self-reported label (descriptive only). Participants are
+# grouped into deciles of predicted probability; vertical bars are 95% Wilson
+# confidence intervals for the observed proportion in each decile.
+def _wilson(k, n, z=1.96):
+    k, n = np.asarray(k, float), np.asarray(n, float)
+    ph = k / n; den = 1 + z**2 / n
+    c = (ph + z**2 / (2 * n)) / den
+    h = z * np.sqrt(ph * (1 - ph) / n + z**2 / (4 * n**2)) / den
+    return c - h, c + h
 
-prob_true, prob_pred = calibration_curve(y_holdout_true, y_holdout_proba,
-                                          n_bins=10, strategy="uniform")
+cal = pd.DataFrame({"y": y_holdout_true, "p": y_holdout_proba})
+cal["bin"] = pd.qcut(cal["p"], q=10, labels=False, duplicates="drop")
+cal_tab = cal.groupby("bin").agg(mean_pred=("p", "mean"), obs=("y", "mean"),
+                                 events=("y", "sum"), n=("y", "size")).reset_index()
+lo, hi = _wilson(cal_tab["events"], cal_tab["n"])
+cal_tab["obs_lo"], cal_tab["obs_hi"] = lo, hi
+cal_tab.to_csv(artifacts_dir / "calibration_deciles_holdout.csv", index=False)
 
+lim = float(max(cal_tab["mean_pred"].max(), cal_tab["obs_hi"].max()) * 1.1)
 fig, ax = plt.subplots(figsize=(7, 7))
-ax.plot(prob_pred, prob_true, marker="o", linewidth=2, color="steelblue",
-        label="AutoGluon ensemble")
-ax.plot([0, 1], [0, 1], linestyle="--", color="grey", label="Perfectly calibrated")
+ax.errorbar(cal_tab["mean_pred"], cal_tab["obs"],
+            yerr=[cal_tab["obs"] - cal_tab["obs_lo"], cal_tab["obs_hi"] - cal_tab["obs"]],
+            marker="o", linewidth=2, capsize=3, color="steelblue", label="Model (deciles, 95% CI)")
+ax.plot([0, lim], [0, lim], linestyle="--", color="grey", label="Perfect calibration")
 ax.set_xlabel("Mean predicted probability", fontsize=12)
-ax.set_ylabel("Observed proportion (stroke)", fontsize=12)
-ax.set_title("Calibration Curve (Holdout Set)", fontsize=13, fontweight="bold")
-ax.legend(fontsize=10)
-ax.set_xlim([0, 1])
-ax.set_ylim([0, 1])
-ax.set_aspect("equal")
-ax.grid(alpha=0.3)
+ax.set_ylabel("Observed proportion (self-reported stroke)", fontsize=12)
+ax.set_title("Calibration against observed label (holdout)", fontsize=13, fontweight="bold")
+ax.legend(fontsize=10, loc="upper left")
+ax.set_xlim([0, lim]); ax.set_ylim([0, lim]); ax.set_aspect("equal"); ax.grid(alpha=0.3)
 
-# Add histogram of predicted probabilities as inset
-ax_inset = fig.add_axes([0.55, 0.15, 0.35, 0.2])
+ax_inset = fig.add_axes([0.22, 0.50, 0.30, 0.18])
 ax_inset.hist(y_holdout_proba, bins=50, color="steelblue", alpha=0.7, edgecolor="white")
 ax_inset.set_xlabel("Predicted P(stroke)", fontsize=8)
 ax_inset.set_ylabel("Count", fontsize=8)
@@ -489,54 +734,6 @@ plt.savefig(artifacts_dir / "fig_roc_prc_holdout.svg", bbox_inches="tight")
 plt.close()
 print("Saved: fig_roc_prc_holdout.png / .pdf / .svg")
 
-# --- Decision Curve Analysis (DCA) ---
-# Measures clinical utility: "Is using this model better than treating everyone
-# or treating no one?" Net benefit weighs true positives against false positives
-# at each threshold probability.
-# Increasingly required by top clinical journals (JAMA, Lancet, BMJ).
-
-thresholds_dca = np.arange(0.01, 0.50, 0.01)
-n_total = len(y_holdout_true)
-prevalence = y_holdout_true.mean()
-
-# Net benefit for the model at each threshold
-nb_model = []
-for pt in thresholds_dca:
-    y_pred_at_pt = (y_holdout_proba >= pt).astype(int)
-    tp = ((y_pred_at_pt == 1) & (y_holdout_true == 1)).sum()
-    fp = ((y_pred_at_pt == 1) & (y_holdout_true == 0)).sum()
-    net_benefit = (tp / n_total) - (fp / n_total) * (pt / (1 - pt))
-    nb_model.append(net_benefit)
-
-# Net benefit for "treat all" strategy
-nb_treat_all = []
-for pt in thresholds_dca:
-    net_benefit = prevalence - (1 - prevalence) * (pt / (1 - pt))
-    nb_treat_all.append(net_benefit)
-
-# Net benefit for "treat none" is always 0
-
-fig, ax = plt.subplots(figsize=(8, 6))
-ax.plot(thresholds_dca, nb_model, linewidth=2, color="steelblue", label="AutoGluon Model")
-ax.plot(thresholds_dca, nb_treat_all, linewidth=1.5, color="grey",
-        linestyle="--", label="Treat All")
-ax.axhline(0, color="black", linestyle=":", linewidth=1, label="Treat None")
-ax.axvline(optimal_threshold, color="red", linestyle="-.", linewidth=1.5, alpha=0.8,
-           label=f"Youden's J threshold ({optimal_threshold:.3f})")
-ax.set_xlabel("Threshold Probability", fontsize=12)
-ax.set_ylabel("Net Benefit", fontsize=12)
-ax.set_title("Decision Curve Analysis (Holdout Set)", fontsize=13, fontweight="bold")
-ax.legend(fontsize=10)
-ax.set_xlim([0, 0.50])
-ax.set_ylim([-0.05, max(max(nb_model), prevalence) + 0.02])
-ax.grid(alpha=0.3)
-plt.tight_layout()
-plt.savefig(artifacts_dir / "fig_dca_holdout.png", dpi=300, bbox_inches="tight")
-plt.savefig(artifacts_dir / "fig_dca_holdout.pdf", bbox_inches="tight")
-plt.savefig(artifacts_dir / "fig_dca_holdout.svg", bbox_inches="tight")
-plt.close()
-print("Saved: fig_dca_holdout.png / .pdf / .svg")
-
 # ==============================================================================
 # 5. BEST MODEL DETAILS
 # ==============================================================================
@@ -555,6 +752,64 @@ print(f"\nAutoGluon leaderboard (top 10):")
 print(leaderboard.head(10).to_string(index=False))
 
 leaderboard.to_csv(artifacts_dir / "autogluon_leaderboard.csv", index=False)
+
+# ------------------------------------------------------------------------------
+# Model-type comparison on the holdout set (Reviewer 2 comment 8)
+# For every model in the final AutoGluon predictor plus a logistic regression
+# reference: AUROC and AUPRC (threshold-free), and threshold metrics at 0.50 and
+# at each model's own Youden threshold learned from its training OOF predictions.
+# ------------------------------------------------------------------------------
+def _family(name):
+    for k in ["NeuralNetTorch", "NeuralNetFastAI", "LightGBM", "CatBoost", "XGBoost",
+              "RandomForest", "ExtraTrees", "KNeighbors", "LinearModel", "WeightedEnsemble"]:
+        if k in name:
+            return k
+    return "Other"
+
+comp_rows = []
+y_tr_full = y_train_cv.values
+for mname in leaderboard["model"].tolist():
+    try:
+        p_h = predictor_final.predict_proba(X_holdout, model=mname)[1].values
+    except Exception as e:
+        print(f"  skip {mname}: {e}"); continue
+    oof_m = autogluon_oof_proba(predictor_final, model=mname)
+    thr_m = youden_threshold(y_tr_full, oof_m) if (oof_m is not None and len(oof_m) == len(y_tr_full)) else np.nan
+    row = {"model": mname, "family": _family(mname),
+           "auroc": roc_auc_score(y_holdout_true, p_h),
+           "auprc": average_precision_score(y_holdout_true, p_h),
+           "brier_score": brier_score_loss(y_holdout_true, p_h)}
+    row.update({f"{k}_t050": v for k, v in threshold_metrics(y_holdout_true, p_h, 0.5).items()
+                if k in ["balanced_accuracy", "sensitivity", "specificity"]})
+    if not np.isnan(thr_m):
+        row.update({f"{k}_youden": v for k, v in threshold_metrics(y_holdout_true, p_h, thr_m).items()
+                    if k in ["threshold", "balanced_accuracy", "sensitivity", "specificity"]})
+    comp_rows.append(row)
+
+# Logistic regression reference: fit on training set; Youden threshold from 5-fold OOF
+Xtr_lr = one_hot(X_train_cv); Xho_lr = one_hot(X_holdout, Xtr_lr.columns)
+oof_lr = cross_val_predict(logistic_reference(), Xtr_lr, y_tr_full, method="predict_proba",
+                           cv=StratifiedKFold(5, shuffle=True, random_state=RANDOM_SEED))[:, 1]
+p_lr_h = logistic_reference().fit(Xtr_lr, y_tr_full).predict_proba(Xho_lr)[:, 1]
+thr_lr = youden_threshold(y_tr_full, oof_lr)
+row = {"model": "LogisticRegression_reference", "family": "LogisticRegression",
+       "auroc": roc_auc_score(y_holdout_true, p_lr_h),
+       "auprc": average_precision_score(y_holdout_true, p_lr_h),
+       "brier_score": brier_score_loss(y_holdout_true, p_lr_h)}
+row.update({f"{k}_t050": v for k, v in threshold_metrics(y_holdout_true, p_lr_h, 0.5).items()
+            if k in ["balanced_accuracy", "sensitivity", "specificity"]})
+row.update({f"{k}_youden": v for k, v in threshold_metrics(y_holdout_true, p_lr_h, thr_lr).items()
+            if k in ["threshold", "balanced_accuracy", "sensitivity", "specificity"]})
+comp_rows.append(row)
+
+model_comp = pd.DataFrame(comp_rows).sort_values("auroc", ascending=False)
+model_comp.to_csv(artifacts_dir / "model_comparison_holdout.csv", index=False)
+family_best = model_comp.sort_values("auroc", ascending=False).groupby("family").head(1)
+family_best.to_csv(artifacts_dir / "model_comparison_by_family.csv", index=False)
+print("\nBest holdout AUROC by model family:")
+print(family_best[["family", "model", "auroc", "auprc", "balanced_accuracy_t050",
+                   "balanced_accuracy_youden"]].round(3).to_string(index=False))
+print("Exported: model_comparison_holdout.csv, model_comparison_by_family.csv")
 
 # --- Extract weighted ensemble composition ---
 # The best model is typically a WeightedEnsemble that stacks base models.
@@ -838,181 +1093,126 @@ except Exception as e:
         print("  Skipping feature importance analysis.")
 
 # ==============================================================================
-# 7. MONTE CARLO MISCLASSIFICATION SENSITIVITY ANALYSIS
+# 7. PROBABILISTIC BIAS ANALYSIS FOR OUTCOME MISCLASSIFICATION
+# ==============================================================================
+# Goal: estimate model performance against the LATENT true stroke outcome T,
+# given the observed self-report Y* (MCQ160F) and external ranges for the
+# sensitivity (Se) and specificity (Sp) of self-report.
+#
+# Model for the underlying outcome (nondifferential misclassification):
+#   Y* is conditionally independent of the model score s given T, so
+#     P(Y*=1 | s) = Se * pi(s) + (1 - Sp) * (1 - pi(s)),   pi(s) = P(T=1 | s)
+#   => pi(s) = (q(s) - (1 - Sp)) / (Se + Sp - 1),  q(s) = P(Y*=1 | s)
+# q(s) is estimated by isotonic regression of the observed holdout labels on
+# the model score. For each participant, the posterior probability of T=1 is
+#     P(T=1 | Y*=1, s) = Se * pi(s) / q(s)
+#     P(T=1 | Y*=0, s) = (1 - Se) * pi(s) / (1 - q(s))
+# In each iteration, Se and Sp are drawn from their ranges, T is sampled for
+# every holdout participant from these posteriors, and the (fixed) model
+# scores are evaluated against T. Implied true prevalence = mean(pi(s)).
 # ==============================================================================
 
 print("\n" + "=" * 70)
-print("STEP 7: Monte Carlo misclassification sensitivity analysis")
+print("STEP 7: Probabilistic bias analysis (latent outcome reconstruction)")
 print("=" * 70)
 
-# Self-reported stroke has imperfect validity:
-#   Sensitivity: 52-86% (Engstad 2000, Okura 2004, Dey 2015, Woodfield 2015)
-#   Specificity: 90-98% (generally high across studies)
-#
-# We simulate plausible label corruption and re-evaluate model performance
-# under each scenario. The model predictions do NOT change — only the labels
-# we evaluate against change.
+from sklearn.isotonic import IsotonicRegression
 
-print(f"\nMonte Carlo parameters:")
-print(f"  Iterations: {N_MC}")
-print(f"  Sensitivity range: {SENS_RANGE}")
-print(f"  Specificity range: {SPEC_RANGE}")
+print(f"\n  Iterations: {N_MC}")
+print(f"  Sensitivity ~ U{SENS_RANGE}   Specificity ~ U{SPEC_RANGE}")
 
-# Use holdout set predictions — completely unseen during training
-y_true_all = y_holdout_true
-y_pred_proba_all = y_holdout_proba
+y_obs = y_holdout_true
+s_hold = y_holdout_proba
+thr = optimal_threshold
+yhat_thr = (s_hold >= thr).astype(int)
 
-# Naive performance (assuming perfect labels) — same as holdout metrics
-naive_auroc = holdout_auroc
-naive_balacc = holdout_balacc
-naive_f1 = holdout_f1
-naive_auprc = holdout_auprc
-naive_brier = holdout_brier
+# q(s) = P(Y*=1 | s): monotone calibration of the model score to observed labels
+q_hat = IsotonicRegression(y_min=1e-4, y_max=1 - 1e-4, out_of_bounds="clip") \
+    .fit(s_hold, y_obs).predict(s_hold)
 
-# Report naive at optimal threshold for threshold-dependent metrics
-naive_balacc_opt = balanced_accuracy_score(y_holdout_true, (y_holdout_proba >= optimal_threshold).astype(int))
-naive_f1_opt = f1_score(y_holdout_true, (y_holdout_proba >= optimal_threshold).astype(int))
+def _threshold_metrics(y, yhat):
+    tp = np.sum((yhat == 1) & (y == 1)); fn = np.sum((yhat == 0) & (y == 1))
+    tn = np.sum((yhat == 0) & (y == 0)); fp = np.sum((yhat == 1) & (y == 0))
+    sens = tp / max(tp + fn, 1); spec = tn / max(tn + fp, 1); ppv = tp / max(tp + fp, 1)
+    return {"balanced_accuracy": (sens + spec) / 2, "f1": 2 * ppv * sens / max(ppv + sens, 1e-12),
+            "recall": sens, "specificity": spec, "precision": ppv,
+            "tp": tp, "fn": fn, "tn": tn, "fp": fp}
 
-print(f"\nNaive performance (assuming perfect labels):")
-print(f"  Threshold-independent:")
-print(f"    AUROC:    {naive_auroc:.4f}")
-print(f"    AUPRC:    {naive_auprc:.4f}")
-print(f"    Brier:    {naive_brier:.4f}")
-print(f"  At optimal threshold ({optimal_threshold:.4f}):")
-print(f"    BalAcc:   {naive_balacc_opt:.4f}")
-print(f"    F1:       {naive_f1_opt:.4f}")
+naive = {"auroc": holdout_auroc, "auprc": holdout_auprc, "brier_score": holdout_brier,
+         **_threshold_metrics(y_obs, yhat_thr)}
 
-# Monte Carlo simulation
-mc_results = []
-np.random.seed(RANDOM_SEED)
-
+rng_pba = np.random.default_rng(RANDOM_SEED)
+pba_results = []
 for i in range(N_MC):
-    # Draw plausible sensitivity and specificity
-    sens = np.random.uniform(*SENS_RANGE)
-    spec = np.random.uniform(*SPEC_RANGE)
-
-    # Corrupt labels
-    y_corrupted = y_true_all.copy()
-
-    # Among labeled stroke=1: flip (1-sens) fraction to 0
-    stroke_mask = y_true_all == 1
-    n_stroke = stroke_mask.sum()
-    n_flip_stroke = int(np.round((1 - sens) * n_stroke))
-    if n_flip_stroke > 0:
-        flip_idx = np.random.choice(np.where(stroke_mask)[0], n_flip_stroke, replace=False)
-        y_corrupted[flip_idx] = 0
-
-    # Among labeled stroke=0: flip (1-spec) fraction to 1
-    no_stroke_mask = y_true_all == 0
-    n_no_stroke = no_stroke_mask.sum()
-    n_flip_no_stroke = int(np.round((1 - spec) * n_no_stroke))
-    if n_flip_no_stroke > 0:
-        flip_idx = np.random.choice(np.where(no_stroke_mask)[0], n_flip_no_stroke, replace=False)
-        y_corrupted[flip_idx] = 1
-
-    # Re-evaluate against corrupted labels
-    try:
-        y_pred_at_threshold = (y_pred_proba_all >= optimal_threshold).astype(int)
-        mc_auroc = roc_auc_score(y_corrupted, y_pred_proba_all)
-        mc_balacc = balanced_accuracy_score(y_corrupted, y_pred_at_threshold)
-        mc_f1 = f1_score(y_corrupted, y_pred_at_threshold)
-        mc_recall = recall_score(y_corrupted, y_pred_at_threshold)
-        mc_precision = precision_score(y_corrupted, y_pred_at_threshold, zero_division=0)
-        mc_auprc = average_precision_score(y_corrupted, y_pred_proba_all)
-        mc_brier = brier_score_loss(y_corrupted, y_pred_proba_all)
-
-        # Confusion matrix
-        mc_cm = confusion_matrix(y_corrupted, y_pred_at_threshold)
-        mc_tn, mc_fp, mc_fn, mc_tp = mc_cm.ravel()
-    except ValueError:
+    se = rng_pba.uniform(*SENS_RANGE)
+    sp = rng_pba.uniform(*SPEC_RANGE)
+    pi_s = np.clip((q_hat - (1 - sp)) / (se + sp - 1), 0, 1)
+    p_t1_pos = np.clip(se * pi_s / q_hat, 0, 1)
+    p_t1_neg = np.clip((1 - se) * pi_s / (1 - q_hat), 0, 1)
+    u = rng_pba.random(len(y_obs))
+    T = np.where(y_obs == 1, u < p_t1_pos, u < p_t1_neg).astype(int)
+    if T.sum() < 5 or T.sum() == len(T):
         continue
-
-    mc_results.append({
-        "iteration": i + 1,
-        "sensitivity": sens,
-        "specificity": spec,
-        "auroc": mc_auroc,
-        "balanced_accuracy": mc_balacc,
-        "f1": mc_f1,
-        "recall": mc_recall,
-        "precision": mc_precision,
-        "auprc": mc_auprc,
-        "brier_score": mc_brier,
-        "tn": mc_tn,
-        "fp": mc_fp,
-        "fn": mc_fn,
-        "tp": mc_tp,
+    pba_results.append({
+        "iteration": i + 1, "sensitivity": se, "specificity": sp,
+        "implied_true_prevalence": pi_s.mean(),
+        "frac_scores_pi_clipped_zero": np.mean(pi_s == 0),
+        "auroc": roc_auc_score(T, s_hold),
+        "auprc": average_precision_score(T, s_hold),
+        "brier_score": brier_score_loss(T, s_hold),
+        **_threshold_metrics(T, yhat_thr),
     })
 
-mc_df = pd.DataFrame(mc_results)
+mc_df = pd.DataFrame(pba_results)
+print(f"\n  Valid iterations: {len(mc_df)} / {N_MC}")
+print(f"  Observed prevalence (holdout): {y_obs.mean():.4f}")
+print(f"  Implied true prevalence: median {mc_df['implied_true_prevalence'].median():.4f} "
+      f"[{mc_df['implied_true_prevalence'].quantile(0.025):.4f}, "
+      f"{mc_df['implied_true_prevalence'].quantile(0.975):.4f}]")
 
-print(f"\nMonte Carlo corrected performance ({N_MC} iterations):")
-print(f"\n  Threshold-independent:")
-print(f"  {'Metric':<20s} {'Naive':>8s} {'MC Mean':>8s} {'MC 2.5%':>8s} {'MC 97.5%':>8s}")
-print("  " + "-" * 55)
-for metric, naive_val in [("auroc", naive_auroc), ("auprc", naive_auprc), ("brier_score", naive_brier)]:
-    mc_vals = mc_df[metric]
-    print(f"  {metric:<20s} {naive_val:8.4f} {mc_vals.mean():8.4f} "
-          f"{mc_vals.quantile(0.025):8.4f} {mc_vals.quantile(0.975):8.4f}")
-
-print(f"\n  At optimal threshold ({optimal_threshold:.4f}):")
-print(f"  {'Metric':<20s} {'Naive':>8s} {'MC Mean':>8s} {'MC 2.5%':>8s} {'MC 97.5%':>8s}")
-print("  " + "-" * 55)
-for metric, naive_val in [
-    ("balanced_accuracy", naive_balacc_opt),
-    ("f1", naive_f1_opt),
-    ("recall", holdout_recall_optimal),
-    ("precision", holdout_precision_optimal),
-]:
-    mc_vals = mc_df[metric]
-    print(f"  {metric:<20s} {naive_val:8.4f} {mc_vals.mean():8.4f} "
-          f"{mc_vals.quantile(0.025):8.4f} {mc_vals.quantile(0.975):8.4f}")
-
-# Confusion matrix summary under misclassification
-print(f"\n  Confusion matrix at optimal threshold (MC median):")
-print(f"    TN:  {mc_df['tn'].median():,.0f}  [{mc_df['tn'].quantile(0.025):,.0f}, {mc_df['tn'].quantile(0.975):,.0f}]")
-print(f"    FP:  {mc_df['fp'].median():,.0f}  [{mc_df['fp'].quantile(0.025):,.0f}, {mc_df['fp'].quantile(0.975):,.0f}]")
-print(f"    FN:  {mc_df['fn'].median():,.0f}  [{mc_df['fn'].quantile(0.025):,.0f}, {mc_df['fn'].quantile(0.975):,.0f}]")
-print(f"    TP:  {mc_df['tp'].median():,.0f}  [{mc_df['tp'].quantile(0.025):,.0f}, {mc_df['tp'].quantile(0.975):,.0f}]")
+summary_rows = []
+print(f"\n  {'Metric':<20s} {'Naive':>8s} {'Median':>8s} {'2.5%':>8s} {'97.5%':>8s}")
+print("  " + "-" * 56)
+for m in ["auroc", "auprc", "brier_score", "balanced_accuracy", "f1",
+          "recall", "specificity", "precision"]:
+    v = mc_df[m]
+    summary_rows.append({"metric": m, "naive": naive[m], "median": v.median(),
+                         "si_lower": v.quantile(0.025), "si_upper": v.quantile(0.975)})
+    print(f"  {m:<20s} {naive[m]:8.4f} {v.median():8.4f} {v.quantile(0.025):8.4f} {v.quantile(0.975):8.4f}")
 
 mc_df.to_csv(artifacts_dir / "monte_carlo_misclassification.csv", index=False)
-print("\nExported: monte_carlo_misclassification.csv")
+pd.DataFrame(summary_rows).to_csv(artifacts_dir / "bias_analysis_summary.csv", index=False)
+print("\nExported: monte_carlo_misclassification.csv, bias_analysis_summary.csv")
 
-# --- Plot: MC distribution vs naive ---
+# --- Plot: latent-outcome performance distributions vs naive ---
 fig, axes = plt.subplots(2, 4, figsize=(20, 9))
 axes = axes.flatten()
-
 plot_metrics = [
-    ("auroc", naive_auroc, "AUROC"),
-    ("auprc", naive_auprc, "AUPRC"),
-    ("brier_score", naive_brier, "Brier Score"),
-    ("balanced_accuracy", naive_balacc_opt, "Balanced Accuracy\n(optimal threshold)"),
-    ("f1", naive_f1_opt, "F1 Score\n(optimal threshold)"),
-    ("recall", holdout_recall_optimal, "Recall / Sensitivity\n(optimal threshold)"),
-    ("precision", holdout_precision_optimal, "Precision / PPV\n(optimal threshold)"),
+    ("auroc", "AUROC"), ("auprc", "AUPRC"), ("brier_score", "Brier score"),
+    ("balanced_accuracy", "Balanced accuracy\n(Youden threshold)"),
+    ("f1", "F1 score\n(Youden threshold)"),
+    ("recall", "Sensitivity\n(Youden threshold)"),
+    ("precision", "PPV\n(Youden threshold)"),
+    ("implied_true_prevalence", "Implied true prevalence"),
 ]
-
-for i, (metric, naive_val, title) in enumerate(plot_metrics):
+for i, (m, title) in enumerate(plot_metrics):
     ax = axes[i]
-    ax.hist(mc_df[metric], bins=50, alpha=0.7, color="steelblue", edgecolor="white")
-    ax.axvline(naive_val, color="red", linestyle="--", linewidth=2,
-               label=f"Naive: {naive_val:.3f}")
-    ax.axvline(mc_df[metric].quantile(0.025), color="orange", linestyle=":", linewidth=1.5,
-               label=f"2.5%: {mc_df[metric].quantile(0.025):.3f}")
-    ax.axvline(mc_df[metric].quantile(0.975), color="orange", linestyle=":", linewidth=1.5,
-               label=f"97.5%: {mc_df[metric].quantile(0.975):.3f}")
-    ax.set_xlabel(title)
-    ax.set_ylabel("Count")
-    ax.set_title(f"{title}\nunder outcome misclassification")
+    v = mc_df[m]
+    ax.hist(v, bins=50, alpha=0.7, color="steelblue", edgecolor="white")
+    ref = y_obs.mean() if m == "implied_true_prevalence" else naive[m]
+    ref_lab = "Observed" if m == "implied_true_prevalence" else "Naive"
+    ax.axvline(ref, color="red", linestyle="--", linewidth=2, label=f"{ref_lab}: {ref:.3f}")
+    ax.axvline(v.quantile(0.025), color="orange", linestyle=":", linewidth=1.5,
+               label=f"2.5%: {v.quantile(0.025):.3f}")
+    ax.axvline(v.quantile(0.975), color="orange", linestyle=":", linewidth=1.5,
+               label=f"97.5%: {v.quantile(0.975):.3f}")
+    ax.set_xlabel(title); ax.set_ylabel("Count"); ax.set_title(title)
     ax.legend(fontsize=7)
     ax.text(-0.1, 1.05, chr(97 + i), transform=ax.transAxes, fontsize=16, fontweight="bold")
 
-# Hide unused subplot
-axes[7].set_visible(False)
-
-plt.suptitle("Monte Carlo Misclassification Sensitivity Analysis\n"
-             f"(N={N_MC}, Sensitivity=[{SENS_RANGE[0]},{SENS_RANGE[1]}], "
-             f"Specificity=[{SPEC_RANGE[0]},{SPEC_RANGE[1]}])",
+plt.suptitle("Probabilistic bias analysis: performance against the reconstructed latent outcome\n"
+             f"(N={N_MC}, Se ~ U({SENS_RANGE[0]}, {SENS_RANGE[1]}), "
+             f"Sp ~ U({SPEC_RANGE[0]}, {SPEC_RANGE[1]}), nondifferential misclassification)",
              fontsize=12, fontweight="bold")
 plt.tight_layout()
 plt.savefig(artifacts_dir / "fig_monte_carlo_misclassification.png", dpi=300, bbox_inches="tight")
@@ -1020,6 +1220,40 @@ plt.savefig(artifacts_dir / "fig_monte_carlo_misclassification.pdf", bbox_inches
 plt.savefig(artifacts_dir / "fig_monte_carlo_misclassification.svg", bbox_inches="tight")
 plt.close()
 print("Saved: fig_monte_carlo_misclassification.png / .pdf / .svg")
+
+# ------------------------------------------------------------------------------
+# Table 2 export: every manuscript value written directly from code
+# ------------------------------------------------------------------------------
+_pba = pd.DataFrame(summary_rows).set_index("metric")
+_ci = {t: g.set_index("metric") for t, g in holdout_ci.groupby("threshold")}
+_fmt_ci = lambda t, m: f"{_ci[t].loc[m,'estimate']:.3f} [{_ci[t].loc[m,'ci_lower']:.3f}, {_ci[t].loc[m,'ci_upper']:.3f}]"
+_h050 = threshold_metrics(y_holdout_true, y_holdout_proba, 0.5)
+_hyj = threshold_metrics(y_holdout_true, y_holdout_proba, optimal_threshold)
+_fmt_cv = lambda c: f"{cv_df[c].mean():.3f} ± {cv_df[c].std():.3f}" if c in cv_df and cv_df[c].notna().any() else "---"
+_fmt_pba = lambda m: f"{_pba.loc[m,'median']:.3f} [{_pba.loc[m,'si_lower']:.3f}, {_pba.loc[m,'si_upper']:.3f}]"
+table2 = pd.DataFrame([
+    ["AUROC", _fmt_cv("auroc"), _fmt_ci("0.50", "auroc"), "---", _fmt_pba("auroc")],
+    ["AUPRC", _fmt_cv("auprc"), _fmt_ci("0.50", "auprc"), "---", _fmt_pba("auprc")],
+    ["Brier score", _fmt_cv("brier_score"), _fmt_ci("0.50", "brier_score"), "---", _fmt_pba("brier_score")],
+    ["Calibration intercept", "---", _fmt_ci("0.50", "calibration_intercept"), "---", "---"],
+    ["Calibration slope", "---", _fmt_ci("0.50", "calibration_slope"), "---", "---"],
+    ["Balanced accuracy", _fmt_cv("balanced_accuracy_train_thr"), _fmt_ci("0.50", "balanced_accuracy"),
+     _fmt_ci("youden", "balanced_accuracy"), _fmt_pba("balanced_accuracy")],
+    ["F1 score", _fmt_cv("f1_train_thr"), _fmt_ci("0.50", "f1"), _fmt_ci("youden", "f1"), _fmt_pba("f1")],
+    ["Sensitivity (model recall)", _fmt_cv("sensitivity_train_thr"), _fmt_ci("0.50", "sensitivity"),
+     _fmt_ci("youden", "sensitivity"), _fmt_pba("recall")],
+    ["Specificity", _fmt_cv("specificity_train_thr"), _fmt_ci("0.50", "specificity"),
+     _fmt_ci("youden", "specificity"), _fmt_pba("specificity")],
+    ["PPV", _fmt_cv("ppv_train_thr"), _fmt_ci("0.50", "ppv"), _fmt_ci("youden", "ppv"), _fmt_pba("precision")],
+    ["TP / FN / TN / FP", "---", f"{_h050['tp']} / {_h050['fn']} / {_h050['tn']} / {_h050['fp']}",
+     f"{_hyj['tp']} / {_hyj['fn']} / {_hyj['tn']} / {_hyj['fp']}", "---"],
+], columns=["Metric", "Cross-validation mean ± SD (train-derived threshold)",
+            "Holdout (t = 0.50) [95% CI]", f"Holdout (Youden t = {optimal_threshold:.3f}) [95% CI]",
+            "Latent-outcome median [95% SI]"])
+table2.to_csv(artifacts_dir / "table2_performance.csv", index=False)
+print("\nTable 2:"); print(table2.to_string(index=False))
+print("Exported: table2_performance.csv")
+
 # ==============================================================================
 # 8. TIER C SENSITIVITY ANALYSIS (with/without alcohol)
 # ==============================================================================
@@ -1032,8 +1266,10 @@ if tier_c_vars:
     print(f"\nRe-running CV WITHOUT Tier C variables: {tier_c_vars}")
 
     # Use the same 80/20 split — only remove Tier C columns
-    X_train_cv_no_tierc = X_train_cv.drop(columns=tier_c_vars, errors="ignore")
-    X_holdout_no_tierc = X_holdout.drop(columns=tier_c_vars, errors="ignore")
+    # Tier C variables are removed BEFORE imputation so they do not inform
+    # imputation of the remaining variables.
+    X_train_cv_no_tierc_raw = X_train_cv_raw.drop(columns=tier_c_vars, errors="ignore")
+    X_holdout_no_tierc_raw = X_holdout_raw.drop(columns=tier_c_vars, errors="ignore")
 
     rskf_sens = RepeatedStratifiedKFold(
         n_splits=N_SPLITS,
@@ -1043,9 +1279,13 @@ if tier_c_vars:
 
     sens_results = []
 
-    for fold_idx, (train_idx, test_idx) in enumerate(rskf_sens.split(X_train_cv_no_tierc, y_train_cv)):
-        train_data = pd.concat([X_train_cv_no_tierc.iloc[train_idx], y_train_cv.iloc[train_idx]], axis=1)
-        test_data = pd.concat([X_train_cv_no_tierc.iloc[test_idx], y_train_cv.iloc[test_idx]], axis=1)
+    for fold_idx, (train_idx, test_idx) in enumerate(rskf_sens.split(X_train_cv_no_tierc_raw, y_train_cv)):
+        X_tr_imp, X_te_imp = impute_split(
+            X_train_cv_no_tierc_raw.iloc[train_idx], X_train_cv_no_tierc_raw.iloc[test_idx],
+            codebook, feature_cols_no_tierc, cache_dir=IMPUTE_CACHE, tag=f"notierc_fold{fold_idx}",
+        )
+        train_data = pd.concat([X_tr_imp, y_train_cv.iloc[train_idx]], axis=1)
+        test_data = pd.concat([X_te_imp, y_train_cv.iloc[test_idx]], axis=1)
 
         predictor_sens = TabularPredictor(
             label="stroke",
@@ -1087,6 +1327,10 @@ if tier_c_vars:
 
     # --- Also evaluate on holdout set (apples-to-apples with primary model) ---
     print(f"\n  Training final no-Tier-C model on full training set...")
+    X_train_cv_no_tierc, X_holdout_no_tierc = impute_split(
+        X_train_cv_no_tierc_raw, X_holdout_no_tierc_raw, codebook, feature_cols_no_tierc,
+        cache_dir=IMPUTE_CACHE, tag="notierc_final",
+    )
     train_data_no_tierc_full = pd.concat([X_train_cv_no_tierc, y_train_cv], axis=1)
 
     predictor_no_tierc_final = TabularPredictor(
@@ -1165,9 +1409,9 @@ Primary Results:
     AUPRC:              {holdout_auprc:.4f}
     Brier Score:        {holdout_brier:.4f}
 
-Monte Carlo Misclassification (N={N_MC}, on holdout set):
-  Naive AUROC:        {naive_auroc:.4f}
-  Corrected AUROC:    {mc_df['auroc'].mean():.4f} [{mc_df['auroc'].quantile(0.025):.4f}, {mc_df['auroc'].quantile(0.975):.4f}]
+Probabilistic bias analysis (N={N_MC}, holdout set, latent outcome):
+  Naive AUROC:                {holdout_auroc:.4f}
+  AUROC vs latent outcome:    {mc_df['auroc'].median():.4f} [{mc_df['auroc'].quantile(0.025):.4f}, {mc_df['auroc'].quantile(0.975):.4f}]
 
 Outputs (all figures in .png, .pdf, .svg):
   Data:
@@ -1176,13 +1420,13 @@ Outputs (all figures in .png, .pdf, .svg):
     autogluon_leaderboard.csv                  (model ensemble details)
     ensemble_weights.csv                       (weighted ensemble composition)
     shap_importance.csv                        (SHAP feature rankings)
-    monte_carlo_misclassification.csv          (MC simulation results)
+    monte_carlo_misclassification.csv          (bias analysis iterations)
+    bias_analysis_summary.csv                  (bias analysis median and 95% SI)
     sensitivity_no_tierc_results.csv           (Tier C sensitivity)
 
   Figures:
     fig_calibration_holdout                    (calibration / reliability diagram)
     fig_roc_prc_holdout                        (ROC + precision-recall curves)
-    fig_dca_holdout                            (decision curve analysis)
     fig_shap_beeswarm                          (SHAP global importance)
     fig_shap_bar                               (SHAP bar plot)
     fig_shap_dependence                        (SHAP dependence plots, top 6)

@@ -3,7 +3,7 @@
   "version": "1.4.0",
   "lite": false,
   "py_version": "3.12",
-  "py_version_micro": "3.12.12",
+  "py_version_micro": "3.12.13",
   "packages": {
     "colorama": "0.4.6",
     "setproctitle": "1.2.2",

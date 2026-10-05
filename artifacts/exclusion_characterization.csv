@@ -1,0 +1,3 @@
+"included","n","age_mean","age_sd","pct_female","pct_nh_white","pct_nh_black","pct_college","pir_mean","pir_sd"
+FALSE,92,65.4,15.3,43.5,48.9,8.7,14.9,1.99,1.4
+TRUE,52507,50.4,18.2,52.2,45.2,20.2,23.8,2.56,1.63

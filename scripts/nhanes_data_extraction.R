@@ -5,6 +5,43 @@
 # Author: Taofeeq O. Togunwa
 ################################################################################
 
+# --- Resolve the repository root (works from RStudio or Rscript) ---
+.script_path <- function() {
+  a <- commandArgs(trailingOnly = FALSE)
+  f <- sub("^--file=", "", a[grep("^--file=", a)])
+  if (length(f)) return(normalizePath(f[1]))
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    p <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) "")
+    if (nzchar(p)) return(normalizePath(p))
+  }
+  ""
+}
+.repo_root <- function() {
+  sp <- .script_path()
+  if (nzchar(sp)) return(dirname(dirname(sp)))     # scripts/<file>.R -> repo root
+  p <- normalizePath(getwd())
+  while (!dir.exists(file.path(p, "scripts")) && dirname(p) != p) p <- dirname(p)
+  p
+}
+setwd(.repo_root())
+if (!dir.exists("scripts")) {
+  stop("Could not find the repository root. Run setwd(\"/path/to/nhanes-stroke-monte-carlo-misclassification\") first.")
+}
+cat("Working directory:", getwd(), "\n")
+dir.create("artifacts", showWarnings = FALSE)
+dir.create("data", showWarnings = FALSE)
+dir.create("logs", showWarnings = FALSE)
+
+# --- Log console output to logs/stage1_extraction.log (for review bundle) ---
+dir.create("logs", showWarnings = FALSE)
+.log_con <- file("logs/stage1_extraction.log", open = "wt")
+sink(.log_con, split = TRUE)
+
+# --- Remove stale imputation outputs from the previous pipeline ---
+unlink("data/imputed_folds", recursive = TRUE)
+unlink(c("data/nhanes_stroke_imputed_2003_2023.csv",
+         "data/nhanes_stroke_imputed_2003_2023.parquet"))
+
 # ==============================================================================
 # 0. SETUP
 # ==============================================================================
@@ -40,6 +77,8 @@ demo <- read_nhanes("demo") |>
     ridreth1,          # Race/ethnicity (5-level, available all cycles)
     dmdeduc2,          # Education level (adults 20+)
     indfmpir,          # Poverty-income ratio
+    ridstatr,          # Interview/examination status (1 = interview only, 2 = interview + MEC)
+    ridexprg,          # Pregnancy status at MEC exam (women 20-44)
     # Survey design variables
     sdmvpsu,           # Masked variance pseudo-PSU
     sdmvstra,          # Masked variance pseudo-stratum
@@ -83,7 +122,8 @@ bpq <- read_nhanes("bpq") |>
   select(
     seqn, year,
     bpq020,            # Ever told you had high blood pressure?
-    bpq050a            # Currently taking prescribed medicine for HBP?
+    bpq050a,           # Currently taking prescribed medicine for HBP? (2003-2018)
+    any_of("bpq150")   # Now taking prescribed medicine for HBP? (2021-2023)
   )
 
 # --- Smoking (Questionnaire) ---
@@ -103,10 +143,12 @@ alq <- read_nhanes("alq") |>
   select(
     seqn, year,
     any_of(c(
-      "alq130",          # Avg # alcoholic drinks/day in past 12 months
-      "alq101",          # Had at least 12 alcohol drinks/1 yr? (2005+)
-      "alq111",          # Had at least 12 alcohol drinks/lifetime? (2005+)
-      "alq110"           # Had at least 12 alcohol drinks/lifetime? (2003)
+      "alq130",          # Avg # drinks on days drinking, past 12 months
+      "alq101",          # Had at least 12 drinks in any 1 year? (2003-2016)
+      "alq110",          # Had at least 12 drinks in lifetime? (2003-2016)
+      "alq111",          # Ever had a drink of any alcohol? (2017+)
+      "alq120q",         # How often drank alcohol, past 12 months (2003-2016; 0 = none)
+      "alq121"           # Past 12 months how often drank (2017+; "Never in the last year")
     ))
   )
 
@@ -132,7 +174,9 @@ paq <- read_nhanes("paq") |>
       "pad790q",         # Frequency of moderate leisure-time PA
       "pad800",          # Minutes of moderate LTPA
       "pad810q",         # Frequency of vigorous leisure-time PA
-      "pad820"           # Minutes of vigorous LTPA
+      "pad820",          # Minutes of vigorous LTPA
+      "pad790u",         # Unit for PAD790Q (day / week / month / year)
+      "pad810u"          # Unit for PAD810Q
     ))
   )
 
@@ -168,62 +212,77 @@ slq <- tryCatch(
 # --- Glycohemoglobin (Lab) ---
 # Standard table "ghb" covers 2005+. For 2003, LBXGH is in "l10_c".
 # nhanesdata merges all cycles into "ghb" — check if 2003 is included.
+# Helper: report per-cycle availability of a lab variable and patch a cycle from
+# an alternative table if it is absent. Uses cat() so messages appear in the log.
+.report_avail <- function(df, vars, label) {
+  v <- intersect(vars, names(df))
+  if (!length(v)) { cat("  [!]", label, ": none of", paste(vars, collapse = "/"), "present\n"); return(invisible()) }
+  tab <- df |> filter(year %in% 2003:2021) |> group_by(year) |>
+    summarise(non_missing = sum(!is.na(.data[[v[1]]])), .groups = "drop")
+  cat("  ", label, " non-missing by cycle: ",
+      paste(tab$year, tab$non_missing, sep = "=", collapse = ", "), "\n", sep = "")
+}
+.patch_cycle <- function(df, vars, alt_tables, cycle, label, cdc_tables = character()) {
+  v <- intersect(vars, names(df))
+  have <- length(v) > 0 && sum(!is.na(df[[v[1]]][df$year == cycle])) > 0
+  if (have) return(df)
+  for (tb in alt_tables) {
+    alt <- tryCatch(read_nhanes(tb), error = function(e) {
+      cat("  [!] could not read table '", tb, "': ", conditionMessage(e), "\n", sep = ""); NULL })
+    if (is.null(alt)) next
+    av <- intersect(vars, names(alt))
+    if (!length(av)) { cat("  [!] '", tb, "' has none of ", paste(vars, collapse = "/"), "\n", sep = ""); next }
+    alt <- alt |> filter(year == cycle) |> select(seqn, year, all_of(av))
+    n_ok <- sum(!is.na(alt[[av[1]]]))
+    if (n_ok > 0) {
+      cat("  -> Patched ", label, " for ", cycle, " from '", tb, "' (", n_ok, " values)\n", sep = "")
+      return(bind_rows(df |> filter(year != cycle), alt))
+    }
+    cat("  [!] '", tb, "' has no non-missing ", label, " for ", cycle, "\n", sep = "")
+  }
+  # Fall back to downloading the cycle-specific CDC table with nhanesA
+  for (tb in cdc_tables) {
+    alt <- tryCatch(nhanesA::nhanes(tb, translated = FALSE), error = function(e) {
+      cat("  [!] nhanesA could not fetch '", tb, "': ", conditionMessage(e), "\n", sep = ""); NULL })
+    if (is.null(alt)) next
+    names(alt) <- tolower(names(alt))
+    av <- intersect(vars, names(alt))
+    if (!length(av)) {
+      cat("  [!] '", tb, "' has none of ", paste(vars, collapse = "/"),
+          "; available: ", paste(head(names(alt), 25), collapse = ", "), "\n", sep = ""); next
+    }
+    alt <- alt |> mutate(year = cycle) |> select(seqn, year, all_of(av))
+    n_ok <- sum(!is.na(alt[[av[1]]]))
+    if (n_ok > 0) {
+      cat("  -> Patched ", label, " for ", cycle, " from CDC table '", tb, "' (", n_ok, " values)\n", sep = "")
+      return(bind_rows(df |> filter(year != cycle), alt))
+    }
+  }
+  cat("  [!] ", label, " remains missing for ", cycle, "\n", sep = "")
+  df
+}
+
 ghb <- read_nhanes("ghb") |>
   select(seqn, year, any_of("lbxgh"))
 
-# If 2003 is missing from ghb, pull from l10_c
-if (!2003 %in% ghb$year[!is.na(ghb$lbxgh)]) {
-  ghb_2003 <- tryCatch(
-    read_nhanes("l10") |>
-      select(seqn, year, any_of("lbxgh")) |>
-      filter(year == 2003),
-    error = function(e) {
-      message("l10 not found for 2003 HbA1c; will remain missing.")
-      NULL
-    }
-  )
-  if (!is.null(ghb_2003) && nrow(ghb_2003) > 0) {
-    ghb <- bind_rows(ghb |> filter(year != 2003), ghb_2003)
-    cat("  → Patched HbA1c for 2003 from l10\n")
-  }
-}
+.report_avail(ghb, "lbxgh", "HbA1c")
+ghb <- .patch_cycle(ghb, "lbxgh", c("l10", "lab10"), 2003, "HbA1c", cdc_tables = "L10_C")
 
 # --- Total Cholesterol (Lab) ---
 # Standard table "tchol" covers 2005+. For 2003, LBXTC is in "l13_c".
 tchol <- read_nhanes("tchol") |>
   select(seqn, year, any_of("lbxtc"))
-
-if (!2003 %in% tchol$year[!is.na(tchol$lbxtc)]) {
-  tchol_2003 <- tryCatch(
-    read_nhanes("l13") |>
-      select(seqn, year, any_of(c("lbxtc", "lbdhdd", "lbdhdl"))) |>
-      filter(year == 2003),
-    error = function(e) NULL
-  )
-  if (!is.null(tchol_2003) && nrow(tchol_2003) > 0) {
-    tchol <- bind_rows(
-      tchol |> filter(year != 2003),
-      tchol_2003 |> select(seqn, year, any_of("lbxtc"))
-    )
-    cat("  → Patched Total Cholesterol for 2003 from l13\n")
-  }
-}
+.report_avail(tchol, "lbxtc", "Total cholesterol")
+tchol <- .patch_cycle(tchol, "lbxtc", c("l13", "lab13"), 2003, "Total cholesterol",
+                      cdc_tables = "L13_C")
 
 # --- HDL Cholesterol (Lab) ---
 # Standard table "hdl" covers 2005+. For 2003, HDL is also in "l13_c".
 hdl <- read_nhanes("hdl") |>
   select(seqn, year, any_of(c("lbdhdd", "lbdhdl")))
-
-if (!2003 %in% hdl$year[!is.na(hdl[[intersect(c("lbdhdd","lbdhdl"), names(hdl))[1]]])]) {
-  # Reuse tchol_2003 if it was loaded (l13 has both TC and HDL)
-  if (exists("tchol_2003") && !is.null(tchol_2003) && nrow(tchol_2003) > 0) {
-    hdl_2003 <- tchol_2003 |> select(seqn, year, any_of(c("lbdhdd", "lbdhdl")))
-    if (ncol(hdl_2003) > 2) {
-      hdl <- bind_rows(hdl |> filter(year != 2003), hdl_2003)
-      cat("  → Patched HDL for 2003 from l13\n")
-    }
-  }
-}
+.report_avail(hdl, c("lbdhdd", "lbdhdl"), "HDL cholesterol")
+hdl <- .patch_cycle(hdl, c("lbdhdd", "lbdhdl", "lbxhdd"), c("l13", "lab13"), 2003,
+                    "HDL cholesterol", cdc_tables = "L13_C")
 
 # --- Triglycerides (Lab) ---
 # Standard table "trigly" covers 2005+. For 2003, LBXTR is in "l13am_c".
@@ -282,6 +341,21 @@ if (!is.na(scr_col) && !2003 %in% biopro$year[!is.na(biopro[[scr_col]])]) {
     cat("  → Patched Creatinine for 2003 from l40\n")
   }
 }
+
+# --- Phlebotomy weight (2021-2023 only) ---
+# For August 2021-August 2023, NCHS provides WTPH2YR, which must be used for
+# analyses involving blood-based analytes. It is carried in the blood lab files.
+wtph <- purrr::map(c("ghb", "cbc", "tchol", "hdl", "biopro"), function(tb) {
+  tryCatch(read_nhanes(tb) |> filter(year == 2021) |> select(seqn, year, any_of("wtph2yr")),
+           error = function(e) NULL)
+}) |>
+  purrr::compact() |>
+  purrr::keep(~ "wtph2yr" %in% names(.x)) |>
+  bind_rows() |>
+  filter(!is.na(wtph2yr)) |>
+  distinct(seqn, year, .keep_all = TRUE)
+if (nrow(wtph) == 0) stop("WTPH2YR not found in 2021-2023 blood lab files; check nhanesdata tables.")
+cat("  WTPH2YR found for", nrow(wtph), "participants in 2021-2023\n")
 
 # --- Complete Blood Count (Lab) ---
 # Standard table "cbc" covers 2005+. For 2003, LBXWBCSI is in "l25_c".
@@ -349,6 +423,7 @@ dat <- demo |>
   left_join(smq,    by = join_keys) |>
   left_join(alq,    by = join_keys) |>
   left_join(paq,    by = join_keys) |>
+  left_join(wtph,   by = join_keys) |>
   left_join(diq,    by = join_keys) |>
   left_join(mcq,    by = join_keys) |>
   left_join(ghb,    by = join_keys) |>
@@ -533,12 +608,52 @@ dat <- dat |>
 
 cat("\nAfter restricting to valid stroke response (Yes/No):",
     nrow(dat), "participants\n")
+
+# ------------------------------------------------------------------------------
+# 3b. RESTRICT TO PARTICIPANTS ELIGIBLE FOR THE MEC AND LABORATORY COMPONENTS
+# ------------------------------------------------------------------------------
+# The model uses examination (BP, body measures) and blood laboratory predictors,
+# so the target population is adults who completed the MEC examination.
+#   - RIDSTATR = 2 (interviewed and MEC-examined), equivalently WTMEC2YR > 0
+#   - Not pregnant at the MEC examination (RIDEXPRG)
+#   - 2021-2023: WTPH2YR > 0 (phlebotomy weight required for blood analytes)
+
+is_mec   <- function(x) grepl("MEC", as.character(x), ignore.case = TRUE) | as.character(x) == "2"
+is_preg  <- function(x) grepl("^Yes", as.character(x)) | as.character(x) == "1"
+
+# RIDSTATR by cycle among adults with a valid outcome (reported in Supplement)
+ridstatr_by_cycle <- dat |>
+  count(year, ridstatr) |>
+  group_by(year) |> mutate(pct = round(100 * n / sum(n), 1)) |> ungroup()
+print(ridstatr_by_cycle)
+write.csv(ridstatr_by_cycle, "artifacts/ridstatr_by_cycle.csv", row.names = FALSE)
+
+flow <- list(tibble::tibble(step = "Adults 20+ with valid stroke response", year = dat$year))
+dat <- dat |> filter(is_mec(ridstatr), !is.na(wtmec2yr), wtmec2yr > 0)
+flow <- c(flow, list(tibble::tibble(step = "MEC-examined (RIDSTATR = 2, WTMEC2YR > 0)", year = dat$year)))
+dat <- dat |> filter(!(is_preg(ridexprg) %in% TRUE))
+flow <- c(flow, list(tibble::tibble(step = "Not pregnant at MEC examination", year = dat$year)))
+dat <- dat |> filter(year < 2021 | (!is.na(wtph2yr) & wtph2yr > 0))
+flow <- c(flow, list(tibble::tibble(step = "2021-2023: phlebotomy weight > 0", year = dat$year)))
+
+cohort_flow <- bind_rows(flow) |>
+  count(step, year) |>
+  tidyr::pivot_wider(names_from = year, values_from = n) |>
+  mutate(total = rowSums(across(-step), na.rm = TRUE))
+cohort_flow <- cohort_flow[match(unique(bind_rows(flow)$step), cohort_flow$step), ]
+print(cohort_flow)
+write.csv(cohort_flow, "artifacts/cohort_flow_by_cycle.csv", row.names = FALSE)
+cat("Final analytic cohort:", nrow(dat), "participants;",
+    sum(dat$mcq160f == "Yes"), "stroke cases\n")
 cat("Stroke cases (Yes):", sum(dat$mcq160f == "Yes"), "\n")
 cat("Non-stroke (No):",   sum(dat$mcq160f == "No"), "\n")
 
 # ==============================================================================
 # 4. HARMONIZE VARIABLES ACROSS CYCLES
 # ==============================================================================
+
+if (!"bpq150" %in% names(dat)) dat$bpq150 <- NA_character_
+dat$.bpq150 <- as.character(dat$bpq150)
 
 dat <- dat |>
   mutate(
@@ -547,7 +662,7 @@ dat <- dat |>
     stroke = as.integer(mcq160f == "Yes"),  # 1 = Yes, 0 = No
     
     # ---- DEMOGRAPHICS ----
-    age       = ridageyr,
+    age       = pmin(ridageyr, 80),   # 2003-2006 top-coded at 85; harmonize to 80
     sex       = factor(riagendr, levels = c("Male", "Female")),
     
     # Race/ethnicity: use ridreth1 (5-level, available all cycles)
@@ -637,9 +752,11 @@ mutate(across(matches("^bpx(o)?(sy|di)[1-3]$"), ~na_if(., 0))) |>
     # BPQ020: Ever told HBP? BPQ050A: Currently taking meds?
     # nhanesdata returns "Yes"/"No" text labels
     htn_med = case_when(
-      bpq050a == "Yes" ~ 1L,   # Yes, taking meds
-      bpq020 == "No"   ~ 0L,   # Never told HBP → not on meds
+      bpq050a == "Yes" ~ 1L,   # 2003-2018: taking meds
+      .bpq150 == "Yes" ~ 1L,   # 2021-2023: BPQ050A replaced by BPQ150
+      bpq020 == "No"   ~ 0L,   # Never told HBP -> not on meds
       bpq050a == "No"  ~ 0L,   # Told HBP but not on meds
+      .bpq150 == "No"  ~ 0L,
       TRUE             ~ NA_integer_
     ),
     
@@ -657,53 +774,84 @@ mutate(across(matches("^bpx(o)?(sy|di)[1-3]$"), ~na_if(., 0))) |>
     smoking = factor(smoking, levels = c("Never", "Former", "Current")),
     
     # ---- ALCOHOL ----
-    # ALQ130: avg drinks/day past 12 months (continuous, among drinkers only)
-    # NHANES skip pattern: non-drinkers (ALQ101/ALQ111/ALQ110 = "No") are
-    # never asked ALQ130, so they appear as NA. We set these to 0 drinks/day.
-    # Also convert 777 (Refused) and 999 (Don't know) to NA.
-    alcohol_drinks_per_day = case_when(
-      # Explicit non-drinkers from screener: 0 drinks
-      !is.na(alq101) & alq101 == "No"  ~ 0,
-      !is.na(alq111) & alq111 == "No"  ~ 0,
-      !is.na(alq110) & alq110 == "No"  ~ 0,
-      # Valid ALQ130 responses (exclude Refused=777, Don't know=999)
-      !is.na(alq130) & as.numeric(alq130) < 100 ~ as.numeric(alq130),
-      # ALQ130 is 777 or 999 → treat as NA
-      !is.na(alq130) & as.numeric(alq130) >= 100 ~ NA_real_,
-      # Everything else is truly missing
-      TRUE ~ NA_real_
-    ),
+    # ALQ130 = average number of drinks on the days the participant drank, past
+    # 12 months (drinks per DRINKING day, not per calendar day). It is asked only
+    # of past-year drinkers. Cycle-specific rules (in order of precedence):
+    #   1. Valid ALQ130 (< 100; 777/999 = Refused/Don't know -> missing)
+    #   2. No drinking in the past 12 months -> 0
+    #        2003-2016: ALQ120Q = 0;  2017+: ALQ121 = "Never in the last year"
+    #   3. Lifetime non-drinker -> 0
+    #        2003-2016: ALQ110 = "No" (<12 drinks in lifetime)
+    #        2017+:     ALQ111 = "No" (never had a drink)
+    #   4. 2003-2016: ALQ101 = "No" with no ALQ120Q/ALQ130 response -> 0
+    #   5. Otherwise missing
+    alcohol_drinks_per_day = {
+      a130  <- suppressWarnings(as.numeric(as.character(alq130)))
+      a120q <- suppressWarnings(as.numeric(as.character(alq120q)))
+      a121  <- as.character(alq121)
+      case_when(
+        !is.na(a130) & a130 < 100                                   ~ a130,
+        !is.na(a120q) & a120q == 0                                  ~ 0,
+        a121 %in% c("Never in the last year", "0")                  ~ 0,
+        as.character(alq110) %in% c("No", "2")                      ~ 0,
+        as.character(alq111) %in% c("No", "2")                      ~ 0,
+        as.character(alq101) %in% c("No", "2") & is.na(a120q) & is.na(a130) ~ 0,
+        TRUE                                                        ~ NA_real_
+      )
+    },
     
     # ---- PHYSICAL ACTIVITY (harmonized binary indicator) ----
-    # Three PAQ formats across NHANES cycles:
-    #   2003-2006: PAD200/320 — minutes-based (includes occupational/transport)
-    #   2007-2017: PAQ605/620/650/665 — GPAQ yes/no (work + recreational)
-    #   2021-2023: PAD790Q/800/810Q/820 — frequency/duration (leisure-time only)
-    # LIMITATION: Activity domains differ across formats. 2003-2006 includes
-    # occupational/transport; 2007-2017 includes work + recreation; 2021-2023
-    # is leisure-time only. Document in methods as a known limitation.
-    phys_active = case_when(
-      # 2007-2017 format: any yes to vigorous or moderate work/recreation
-      !is.na(paq650) & paq650 == "Yes" ~ 1L,
-      !is.na(paq665) & paq665 == "Yes" ~ 1L,
-      !is.na(paq605) & paq605 == "Yes" ~ 1L,
-      !is.na(paq620) & paq620 == "Yes" ~ 1L,
-      !is.na(paq650) | !is.na(paq665) |
-        !is.na(paq605) | !is.na(paq620) ~ 0L,
-      # 2021-2023 format: any moderate or vigorous LTPA with >0 minutes
-      !is.na(pad790q) & as.numeric(pad790q) > 0 &
-        !is.na(pad800) & as.numeric(pad800) > 0 ~ 1L,
-      !is.na(pad810q) & as.numeric(pad810q) > 0 &
-        !is.na(pad820) & as.numeric(pad820) > 0 ~ 1L,
-      !is.na(pad790q) & as.numeric(pad790q) == 0 &
-        !is.na(pad810q) & as.numeric(pad810q) == 0 ~ 0L,
-      !is.na(pad790q) | !is.na(pad810q) ~ 0L,
-      # 2003-2006 format: minutes > 0
-      !is.na(pad200) & as.numeric(pad200) > 0 ~ 1L,
-      !is.na(pad320) & as.numeric(pad320) > 0 ~ 1L,
-      !is.na(pad200) | !is.na(pad320) ~ 0L,
-      TRUE ~ NA_integer_
-    ),
+    # Harmonized to ANY MODERATE OR VIGOROUS LEISURE-TIME ACTIVITY in all cycles:
+    #   2003-2006: PAD200 / PAD320 (Yes/No/Unable; leisure time or school,
+    #              past 30 days, >=10 min). Occupational and transport items
+    #              (PAD020, PAQ100) are NOT used.
+    #   2007-2017: GPAQ recreational items PAQ650 / PAQ665 (Yes/No, typical week).
+    #              Work items PAQ605 / PAQ620 are NOT used.
+    #   2021-2023: PAD790Q / PAD810Q (frequency, with units PAD790U / PAD810U)
+    #              and PAD800 / PAD820 (minutes) for moderate / vigorous
+    #              leisure-time activity. Frequency is converted to sessions per
+    #              week and, to match the GPAQ "typical week" threshold used in
+    #              2007-2018, at least one session per week of at least 10
+    #              minutes is required.
+    # Refused / Don't know (7, 9, 77, 99, 7777, 9999) are treated as missing.
+    phys_active = {
+      yn <- function(x) {                       # "Yes"->1, "No"/"Unable"->0, else NA
+        x <- as.character(x)
+        dplyr::case_when(x %in% c("Yes", "1") ~ 1L,
+                         x %in% c("No", "2", "Unable to do activity", "3") ~ 0L,
+                         TRUE ~ NA_integer_)
+      }
+      num <- function(x) {                      # numeric, with refusal codes -> NA
+        x <- suppressWarnings(as.numeric(as.character(x)))
+        dplyr::if_else(x %in% c(7777, 9999, 77777, 99999), NA_real_, x)
+      }
+      rec_0716 <- pmax(yn(paq650), yn(paq665), na.rm = TRUE)
+      lt_0306  <- pmax(yn(pad200), yn(pad320), na.rm = TRUE)
+      per_week <- function(q, u) {                    # sessions per week
+        u <- tolower(as.character(u))
+        dplyr::case_when(
+          grepl("^d", u) ~ num(q) * 7,
+          grepl("^w", u) ~ num(q),
+          grepl("^m", u) ~ num(q) / 4.345,
+          grepl("^y", u) ~ num(q) / 52.143,
+          TRUE           ~ num(q)                     # unit missing: assume weekly
+        )
+      }
+      active_21 <- function(q, u, mins) {
+        f <- per_week(q, u); m <- num(mins)
+        dplyr::if_else(!is.na(f) & f >= 1 & !is.na(m) & m >= 10, 1L,
+                       dplyr::if_else(!is.na(f), 0L, NA_integer_))
+      }
+      mod_21   <- active_21(pad790q, pad790u, pad800)
+      vig_21   <- active_21(pad810q, pad810u, pad820)
+      lt_2123  <- pmax(mod_21, vig_21, na.rm = TRUE)
+      dplyr::case_when(
+        year %in% c(2003, 2005)        ~ lt_0306,
+        year >= 2007 & year <= 2017    ~ rec_0716,
+        year >= 2021                   ~ lt_2123,
+        TRUE                           ~ NA_integer_
+      )
+    },
     
     # ---- SELF-REPORTED DIABETES ----
     diabetes_sr = case_when(
@@ -723,7 +871,7 @@ mutate(across(matches("^bpx(o)?(sy|di)[1-3]$"), ~na_if(., 0))) |>
     # ---- HDL (harmonize variable name) ----
     # Variable name changed across cycles: lbdhdd vs lbdhdl
     # Use coalesce with across() + any_of() for safe column selection
-    hdl_c = do.call(coalesce, across(any_of(c("lbdhdd", "lbdhdl")))),
+    hdl_c = do.call(coalesce, across(any_of(c("lbdhdd", "lbdhdl", "lbxhdd")))),
     
     # ---- SERUM CREATININE (harmonize variable name) ----
     creatinine = do.call(coalesce, across(any_of(c("lbxscr", "lbdscr")))),
@@ -742,6 +890,29 @@ mutate(across(matches("^bpx(o)?(sy|di)[1-3]$"), ~na_if(., 0))) |>
   )
 
 # ==============================================================================
+# 4b. BLOOD PRESSURE METHOD COMPARISON (2017-2018 paired measurements)
+# ==============================================================================
+# In 2017-2018 both auscultatory (BPX) and oscillometric (BPXO) readings exist.
+# Participants with both provide a within-person comparison of the two methods.
+# Descriptive only (no calibration is applied to mean_sbp / mean_dbp).
+
+bp_pair <- dat |>
+  filter(year == 2017, age >= 20, !is.na(sbp_ausc), !is.na(sbp_osci),
+         !is.na(dbp_ausc), !is.na(dbp_osci)) |>
+  transmute(d_sbp = sbp_osci - sbp_ausc, d_dbp = dbp_osci - dbp_ausc)
+
+bp_method_comparison <- tibble::tibble(
+  measure    = c("SBP", "DBP"),
+  n_paired   = nrow(bp_pair),
+  mean_diff  = c(mean(bp_pair$d_sbp), mean(bp_pair$d_dbp)),   # oscillometric - auscultatory
+  sd_diff    = c(sd(bp_pair$d_sbp),   sd(bp_pair$d_dbp)),
+  loa_lower  = mean_diff - 1.96 * sd_diff,                     # Bland-Altman limits
+  loa_upper  = mean_diff + 1.96 * sd_diff
+)
+print(bp_method_comparison)
+write.csv(bp_method_comparison, "artifacts/bp_method_comparison_2017.csv", row.names = FALSE)
+
+# ==============================================================================
 # 5. SELECT ANALYTIC VARIABLES
 # ==============================================================================
 
@@ -749,7 +920,7 @@ analytic <- dat |>
   select(
     # Identifiers & design
     seqn, year,
-    sdmvpsu, sdmvstra, wtmec2yr, wtint2yr,
+    sdmvpsu, sdmvstra, wtmec2yr, wtint2yr, wtph2yr,
     
     # Outcome
     stroke,
@@ -865,7 +1036,8 @@ for (v in predictor_vars) {
     }
   }
 }
-cat("  (*** = p < 0.05; suggests MAR or MNAR, not MCAR)\n")
+cat("  (*** = p < 0.05; indicates missingness is associated with the outcome.\n")
+cat("   This test cannot distinguish MAR from MNAR, and p >= 0.05 does not establish MCAR.)\n")
 
 # ==============================================================================
 # 7. TIERED MISSINGNESS DECISION
@@ -903,29 +1075,76 @@ for (t in unique(overall_miss$tier)) {
 # ==============================================================================
 # 8. CONSTRUCT SURVEY DESIGN OBJECT
 # ==============================================================================
-# The nhanesdata::create_design() function handles multi-cycle weight adjustment.
-# It divides WTMEC2YR by the number of cycles present in the data.
+# Pooled weight: cycle-specific weight divided by the number of cycles (9).
+#   2003-2018: WTMEC2YR (MEC weight; covers MEC blood analytes in these cycles)
+#   2021-2023: WTPH2YR  (phlebotomy weight; required for blood-based analytes)
+# Pseudo-strata are unique across cycles; PSUs are nested within strata.
 
 cat("\n========================================\n")
 cat("SURVEY DESIGN\n")
 cat("========================================\n")
 
-# Determine cycle range
 cycle_years <- sort(unique(analytic$year))
+n_cycles <- length(cycle_years)
 cat("Cycles in analytic data:", paste(cycle_years, collapse = ", "), "\n")
-cat("Number of cycles:", length(cycle_years), "\n")
+cat("Number of cycles:", n_cycles, "\n")
 
-# Create survey design
-# wt_type = "mec" → uses WTMEC2YR (appropriate since we use exam + lab data)
-nhanes_design <- create_design(
-  dsn      = analytic,
-  start_yr = min(cycle_years),
-  end_yr   = max(cycle_years),
-  wt_type  = "mec"
-)
+analytic <- analytic |>
+  mutate(wt_pooled = if_else(year >= 2021, wtph2yr, wtmec2yr) / n_cycles)
 
+library(survey)
+options(survey.lonely.psu = "adjust")
+nhanes_design <- svydesign(ids = ~sdmvpsu, strata = ~sdmvstra, weights = ~wt_pooled,
+                           nest = TRUE, data = analytic)
 cat("Survey design object created successfully.\n")
-cat("Design class:", class(nhanes_design), "\n")
+
+# Component participation among the analytic cohort (reported in Supplement)
+component_participation <- analytic |>
+  group_by(year) |>
+  summarise(
+    n                = n(),
+    blood_pressure   = round(100 * mean(!is.na(mean_sbp)), 1),
+    body_measures    = round(100 * mean(!is.na(bmxbmi)), 1),
+    hba1c            = round(100 * mean(!is.na(hba1c)), 1),
+    lipids           = round(100 * mean(!is.na(total_chol)), 1),
+    creatinine       = round(100 * mean(!is.na(creatinine)), 1),
+    wbc              = round(100 * mean(!is.na(wbc)), 1),
+    .groups = "drop"
+  )
+print(component_participation)
+write.csv(component_participation, "artifacts/component_participation_by_cycle.csv", row.names = FALSE)
+
+# Sample size and outcome prevalence by cycle (unweighted and survey-weighted)
+wprev <- svyby(~stroke, ~year, nhanes_design, svymean, na.rm = TRUE)
+outcome_by_cycle <- analytic |>
+  group_by(year) |>
+  summarise(n = n(), stroke_cases = sum(stroke == 1),
+            prevalence_unweighted = round(100 * mean(stroke == 1), 2),
+            sum_pooled_weight = sum(wt_pooled), .groups = "drop") |>
+  left_join(tibble::tibble(year = wprev$year,
+                           prevalence_weighted = round(100 * wprev$stroke, 2),
+                           prevalence_weighted_se = round(100 * SE(wprev), 2)), by = "year")
+print(outcome_by_cycle)
+write.csv(outcome_by_cycle, "artifacts/outcome_by_cycle.csv", row.names = FALSE)
+
+# Harmonization sanity checks by cycle (physical activity domain, age top-coding,
+# alcohol skip-pattern handling) - printed so they appear in the log
+harmonization_checks <- analytic |>
+  group_by(year) |>
+  summarise(
+    n                  = n(),
+    phys_active_pct    = round(100 * mean(phys_active, na.rm = TRUE), 1),
+    phys_active_miss   = round(100 * mean(is.na(phys_active)), 1),
+    max_age            = max(age, na.rm = TRUE),
+    age_80_pct         = round(100 * mean(age == 80, na.rm = TRUE), 1),
+    alcohol_zero_pct   = round(100 * mean(alcohol_drinks_per_day == 0, na.rm = TRUE), 1),
+    alcohol_median     = median(alcohol_drinks_per_day, na.rm = TRUE),
+    htn_med_pct        = round(100 * mean(htn_med, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+cat("\n--- Harmonization checks by cycle ---\n")
+print(as.data.frame(harmonization_checks))
+write.csv(harmonization_checks, "artifacts/harmonization_checks_by_cycle.csv", row.names = FALSE)
 
 # ==============================================================================
 # 9. WEIGHTED DESCRIPTIVE STATISTICS (TABLE 1 PREVIEW)
@@ -981,7 +1200,7 @@ cat("Exported: nhanes_survey_design.rds\n")
 codebook <- tibble::tribble(
   ~variable,               ~description,                                    ~source,    ~type,         ~tier,
   "stroke",                "Self-reported stroke (MCQ160F)",                 "MCQ",      "binary",      "Outcome",
-  "age",                   "Age at screening (years, 20-80)",                "DEMO",     "continuous",  "Tier 1",
+  "age",                   "Age at screening (years; top-coded at 80 in all cycles)",                "DEMO",     "continuous",  "Tier 1",
   "sex",                   "Sex (Male/Female)",                              "DEMO",     "categorical", "Tier 1",
   "race_eth",              "Race/ethnicity (5-level)",                       "DEMO",     "categorical", "Tier 1",
   "mean_sbp",              "Mean systolic BP (mmHg, avg readings 2-3)",      "BPX/BPXO", "continuous", "Tier 1",
@@ -993,7 +1212,7 @@ codebook <- tibble::tribble(
   "smoking",               "Smoking status (Never/Former/Current)",          "SMQ",      "categorical", "Tier 1",
   "bmxwaist",              "Waist circumference (cm)",                       "BMX",      "continuous",  "Tier 1",
   "bmxbmi",                "Body mass index (kg/m²)",                        "BMX",      "continuous",  "Tier 1",
-  "alcohol_drinks_per_day","Avg alcoholic drinks per day (past 12 mo)",      "ALQ",      "continuous",  "Tier 1",
+  "alcohol_drinks_per_day","Avg drinks per drinking day, past 12 mo (0 = non-drinker)",      "ALQ",      "continuous",  "Tier 1",
   "phys_active",           "Any moderate/vigorous physical activity",         "PAQ",      "binary",      "Tier 1",
   "triglycerides",         "Triglycerides (mg/dL)",                          "TRIGLY",   "continuous",  "Tier 2",
   "creatinine",            "Serum creatinine (mg/dL)",                       "BIOPRO",   "continuous",  "Tier 2",
@@ -1004,6 +1223,13 @@ codebook <- tibble::tribble(
   "diabetes_sr",           "Self-reported diabetes",                         "DIQ",      "binary",      "Tier 2",
   "chd_sr",                "Self-reported coronary heart disease",           "MCQ",      "binary",      "Tier 2"
 )
+
+# Percent missing for each candidate predictor by cycle (reported in Supplement)
+missingness_by_cycle <- analytic |>
+  group_by(year) |>
+  summarise(across(all_of(setdiff(codebook$variable, "stroke")),
+                   ~ round(100 * mean(is.na(.x)), 1)), .groups = "drop")
+write.csv(missingness_by_cycle, "artifacts/missingness_by_cycle.csv", row.names = FALSE)
 
 write.csv(codebook, "artifacts/variable_codebook.csv", row.names = FALSE)
 cat("\nExported: variable_codebook.csv\n")
@@ -1017,3 +1243,6 @@ cat("  2. Export parquet to Python for HyperImpute imputation\n")
 cat("  3. Run knockoff filter feature selection\n")
 cat("  4. Train AutoGluon ensemble with stratified CV\n")
 cat("============================================================\n")
+
+sink()
+close(.log_con)

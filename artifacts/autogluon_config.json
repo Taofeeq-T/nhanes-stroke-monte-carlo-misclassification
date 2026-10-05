@@ -1,0 +1,8 @@
+{
+  "eval_metric": "balanced_accuracy",
+  "presets": "best_quality",
+  "sample_weight": "None",
+  "internal_decision_threshold": 0.023999999999999966,
+  "class_weights_or_resampling": "none specified (AutoGluon defaults)",
+  "autogluon_version": null
+}
