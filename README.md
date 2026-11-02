@@ -5,7 +5,7 @@
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
 [![R 4.4](https://img.shields.io/badge/R-4.4-blue.svg)](https://www.r-project.org/)
 
-> **Status.** Revised manuscript in response to peer review. This repository accompanies the revised paper and is provided for peer review and reproducibility. The code and outputs reflect the revised analysis.
+> **Status.** Second revision in response to peer review. This repository accompanies the revised paper and is provided for peer review and reproducibility. The code and outputs reflect the revised analysis. Files retained from the earlier analysis are listed under [Superseded files](#superseded-files).
 
 ---
 
@@ -23,7 +23,8 @@ MCQ160F asks whether a doctor or other health professional has ever told the par
 - **Threshold-free comparison of learner families** (AUROC and AUPRC) alongside threshold-dependent metrics
 - **SHAP interpretation** of model attribution (association with predicted probability, not causal effects)
 - **Probabilistic bias analysis** (1,000 iterations) that reconstructs the latent true stroke outcome from the observed self-report under nondifferential misclassification, using external sensitivity and specificity ranges, and reports performance against the latent outcome with implied true prevalence
-- **Sensitivity analysis excluding high-missingness predictors** (Tier C, with alcohol retained in the exclusion set)
+- **Sensitivity analyses of the latent-outcome reconstruction**, one estimating latent risk by maximum likelihood under the misclassification model without truncation (Magder and Hughes, 1997), and one cross-fitting q(s) within the holdout so that no participant's own label informs their reconstruction and the interval includes the estimation uncertainty in q(s)
+- **Pre-specified Tier C exclusion sensitivity analysis** (30-50% missingness), which is conditional on a predictor meeting the threshold. No predictor did in the revised cohort, so it was not run
 
 ---
 
@@ -41,8 +42,11 @@ MCQ160F asks whether a doctor or other health professional has ever told the par
 │   ├── missingness_heatmap.R                      # Missingness visualization
 │   ├── fold_imputation.py                         # Train-only HyperImpute wrapper and smoke test
 │   ├── hyperimpute_pipeline.py                    # Final imputation on training rows and diagnostics
-│   ├── autogluon_modeling.py                      # AutoGluon, SHAP, bias analysis, sensitivity
-│   └── fig_pipeline_workflow.py                   # Workflow figure
+│   ├── autogluon_modeling.py                      # AutoGluon, SHAP, calibration, probabilistic bias analysis
+│   ├── bias_sensitivity_mh.py                     # Maximum likelihood (Magder-Hughes) reconstruction; regenerates the iteration file
+│   ├── bias_sensitivity_crossfit.py               # Cross-fitted q(s) within the holdout
+│   ├── bias_sensitivity_oof.py                    # Diagnostic only (OOF training predictions; not used)
+│   └── fig_pipeline_workflow.py                   # Workflow figure (manuscript Figure 6)
 ├── artifacts/                                     # Tables, diagnostics, and figures (see below)
 └── models/
     └── final/                                     # Trained AutoGluon model (holdout evaluation)
@@ -63,16 +67,33 @@ Imputation is performed within each cross-validation fold on training rows only,
 | `missingness_report.csv`, `missingness_by_cycle.csv`, `missingness_mechanism_tests.csv` | Missingness rates, tier assignments, and MAR/MCAR diagnostics |
 | `imputation_diagnostics.csv`, `correlation_diff_pre_post_imputation.csv` | Imputation quality metrics |
 | `table1_weighted_final.csv` | Weighted Table 1 |
+| `missingness_tier_classification.csv`, `exclusion_characterization.csv`, `component_participation_by_cycle.csv` | Tier assignment, characteristics of excluded participants, and survey component participation by cycle |
 | `cv_results.csv` | Per-fold CV performance, including fold-level thresholds |
-| `autogluon_leaderboard.csv`, `ensemble_weights.csv` | AutoGluon model rankings and final ensemble weights |
-| `model_comparison_by_family.csv` | Holdout AUROC, AUPRC, and threshold metrics by learner family, with logistic regression reference |
-| `table2_performance.csv` | Performance summary table for the manuscript |
-| `holdout_predictions.csv` | Holdout predicted probabilities and observed labels |
+| `autogluon_leaderboard.csv`, `autogluon_config.json` | AutoGluon model rankings and configuration |
+| `model_comparison_holdout.csv`, `model_comparison_by_family.csv` | Holdout AUROC, AUPRC, and threshold metrics per model and by learner family, with logistic regression reference |
+| `table2_performance.csv`, `holdout_metrics_ci.csv` | Performance summary table for the manuscript and holdout bootstrap confidence intervals |
+| `holdout_auroc_by_measurement_period.csv` | Holdout AUROC by instrument period |
+| `calibration_deciles_holdout.csv` | Observed and predicted risk by decile with 95% Wilson intervals |
+| `holdout_predictions.csv` | Holdout predicted probabilities and observed labels (input to all bias analyses) |
 | `shap_importance.csv` | SHAP feature importance rankings |
-| `monte_carlo_misclassification.csv` | Bias analysis results for every iteration |
-| `bias_analysis_summary.csv` | Naive value, median, and 95% simulation interval per metric |
-| `sensitivity_no_tierc_results.csv` | Tier C exclusion sensitivity CV results |
-| `fig_*.png` | Missingness heatmap, imputation correlation, ROC and precision-recall, calibration with 95% Wilson intervals, SHAP (bar, beeswarm, dependence), bias analysis (eight panels), and workflow |
+| `monte_carlo_misclassification.csv` | Primary bias analysis, one row per iteration. Sampled self-report parameters are stored as `se_selfreport` and `sp_selfreport`, separate from the model's `recall` and `specificity` (regenerated by `bias_sensitivity_mh.py`) |
+| `bias_analysis_summary.csv` | Primary bias analysis, naive value, median, and 95% simulation interval per metric |
+| `pba_mh_iterations.csv`, `pba_mh_summary.csv`, `pba_mh_manuscript_numbers.json` | Maximum likelihood reconstruction paired with the primary analysis, including the share of participants truncated at zero (Supplementary Table S9) |
+| `pba_crossfit_iterations.csv`, `pba_crossfit_summary.csv`, `pba_crossfit_manuscript_numbers.json` | Cross-fitted q(s), sensitivity version of the latent-outcome column of Table 2 (Supplementary Table S10) |
+| `oof_predictions_train.csv`, `pba_oof_*` | Diagnostic only. OOF training predictions were not on the holdout score scale, so these results are not used |
+| `fig_*.png` | Missingness heatmap, imputation correlation, ROC and precision-recall, calibration with 95% Wilson intervals, SHAP (bar, beeswarm, dependence), bias analysis (eight panels), and workflow (`fig_pipeline_workflow`, Figure 6) |
+
+Every figure is also saved as `.pdf` and `.svg`. `ensemble_weights.csv` is written only when the ensemble weights can be extracted from the fitted predictor and is not part of the current release.
+
+### Artifact provenance
+
+Artifacts from `autogluon_modeling.py` were generated by the pipeline at commit `11f7e2f`. Later edits to that script rename the stored self-report parameters in the bias analysis and update comments and printed output, and do not change any result. The corrected iteration file and all sensitivity analyses are produced by the standalone scripts below, which read `holdout_predictions.csv` and need no retraining.
+
+### Superseded files
+
+| File | Status |
+|------|--------|
+| `artifacts/superseded/sensitivity_no_tierc_results.csv` | From the original submission (commit `dd34897`, earlier cohort). Superseded. No predictor met the Tier C threshold in the revised cohort, so this analysis was not repeated |
 
 ---
 
@@ -85,7 +106,10 @@ Imputation is performed within each cross-validation fold on training rows only,
 | 3 | `missingness_heatmap.R` | Visualizes variable by cycle missingness with the tiered decision framework |
 | 4 | `fold_imputation.py` | Smoke test of the train-only HyperImpute wrapper (optional, a few minutes) |
 | 5 | `hyperimpute_pipeline.py` | Fits column-wise adaptive imputation on training rows and produces distributional diagnostics |
-| 6 | `autogluon_modeling.py` | 80/20 holdout split, repeated stratified 5-fold by 5 CV with fold-wise imputation, final retrain, logistic regression reference, family comparison, SHAP, calibration, probabilistic bias analysis, and Tier C sensitivity |
+| 6 | `autogluon_modeling.py` | 80/20 holdout split, repeated stratified 5-fold by 5 CV with fold-wise imputation, final retrain, logistic regression reference, family comparison, SHAP, calibration, and probabilistic bias analysis. The pre-specified Tier C sensitivity analysis runs only if a predictor meets the Tier C threshold |
+| 7 | `bias_sensitivity_mh.py` | Maximum likelihood reconstruction without truncation, paired with the primary analysis, and regeneration of `monte_carlo_misclassification.csv` (seconds) |
+| 8 | `bias_sensitivity_crossfit.py` | Cross-fitted q(s) within the holdout with bootstrap resampling (under a minute) |
+| 9 | `fig_pipeline_workflow.py` | Workflow figure (Figure 6) |
 
 ---
 
@@ -135,9 +159,18 @@ python scripts/fold_imputation.py
 # 5. Imputation (Python)
 python scripts/hyperimpute_pipeline.py
 
-# 6. Modeling, SHAP, bias analysis, and sensitivity (Python, long runtime)
+# 6. Modeling, SHAP, and bias analysis (Python, long runtime)
 python scripts/autogluon_modeling.py 2>&1 | tee artifacts/run_log.txt
+
+# 7-8. Sensitivity analyses of the bias analysis (Python, no retraining)
+python scripts/bias_sensitivity_mh.py
+python scripts/bias_sensitivity_crossfit.py
+
+# 9. Workflow figure
+python scripts/fig_pipeline_workflow.py
 ```
+
+Steps 7 and 8 read only `artifacts/holdout_predictions.csv` and write logs to `logs/`. `bias_sensitivity_mh.py` checks that every performance column matches the existing `monte_carlo_misclassification.csv` before rewriting it. The diagnostic `bias_sensitivity_oof.py` needs the saved predictor in `models/final/` (or the cached `oof_predictions_train.csv`) and is not part of the reported analysis.
 
 Expected checks after step 1 include a non-empty `cohort_flow_by_cycle.csv`, a maximum age of 80 in every cycle, and nonzero physical activity prevalence in 2003-2005.
 
@@ -155,7 +188,7 @@ N_SHAP = 2000             # SHAP samples
 N_MC = 1000               # Bias analysis iterations
 SENS_RANGE = (0.36, 0.98) # Self-report sensitivity range
 SPEC_RANGE = (0.96, 0.996)# Self-report specificity range
-FORCE_SENSITIVITY_VARS = ["alcohol_drinks_per_day"]  # Always excluded in Tier C sensitivity
+FORCE_SENSITIVITY_VARS = []  # Variables forced into the Tier C sensitivity analysis (none)
 ```
 
 For a quick test run, change to the following.
@@ -204,6 +237,7 @@ Several predictors are self-reported (diabetes, coronary heart disease, smoking,
 - SHAP values describe model attribution and association with predicted probability. They do not indicate causal effects, and some predictors may be consequences or correlates of prior stroke.
 - Evaluation is internal. No later-cycle, separate-survey, or clinically confirmed outcome validation was performed.
 - The Youden's J threshold is a statistical operating point and not a clinical action threshold.
+- The latent-outcome results assume nondifferential misclassification and published sensitivity and specificity ranges. The size of the corrected gain in AUROC depends on how latent risk is reconstructed (median 0.874 with the primary isotonic reconstruction and 0.847 without truncation).
 
 ---
 

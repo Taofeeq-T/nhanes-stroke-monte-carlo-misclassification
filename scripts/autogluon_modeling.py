@@ -3,10 +3,28 @@
 NHANES Stroke Prediction — AutoGluon Modeling Pipeline
 ================================================================================
 Ensemble prediction with:
-  1. Repeated stratified k-fold cross-validation
+  1. Repeated stratified k-fold cross-validation with fold-wise imputation
   2. SHAP-based feature importance and interpretation
-  3. Monte Carlo misclassification sensitivity analysis
-  4. Tier C sensitivity analysis (with/without alcohol)
+  3. Probabilistic bias analysis for outcome misclassification (latent-outcome
+     reconstruction over 1,000 Monte Carlo iterations)
+  4. Pre-specified Tier C exclusion sensitivity analysis. It runs only if a
+     predictor meets the Tier C threshold (30-50% missing). No predictor did in
+     the revised cohort, so it was not run and produces no output.
+
+Sensitivity analyses of the Step 7 reconstruction added in the second revision
+are in separate scripts that read artifacts/holdout_predictions.csv and need no
+retraining:
+  - bias_sensitivity_mh.py        maximum likelihood (Magder-Hughes) reconstruction
+                                  without truncation; also rewrites
+                                  monte_carlo_misclassification.csv with the
+                                  sampled parameters as se_selfreport / sp_selfreport
+  - bias_sensitivity_crossfit.py  q(s) cross-fitted within the holdout
+  - bias_sensitivity_oof.py       diagnostic only (OOF training predictions were
+                                  not on the holdout score scale; not used)
+
+Artifact provenance: the released artifacts from this script were generated at
+commit 11f7e2f. Later edits rename the stored self-report parameters in Step 7
+(se_selfreport, sp_selfreport) and update comments and printed output only.
 
 Requirements:
   pip install autogluon.tabular shap matplotlib seaborn
@@ -221,13 +239,14 @@ df = pd.read_csv(data_dir / "nhanes_stroke_analytic_2003_2023.csv")
 codebook = pd.read_csv(artifacts_dir / "variable_codebook.csv")
 miss_report = pd.read_csv(artifacts_dir / "missingness_report.csv")
 
-# Identify Tier D (excluded) and Tier C (sensitivity analysis) variables
+# Identify Tier D (excluded) and Tier C (sensitivity analysis) variables.
+# In the revised cohort no variable meets the Tier C threshold (see
+# missingness_report.csv), so tier_c_vars is empty and Step 8 is skipped.
 tier_d_vars = miss_report[miss_report["tier"].str.startswith("D")]["variable"].tolist()
 tier_c_vars = miss_report[miss_report["tier"].str.startswith("C")]["variable"].tolist()
-# Alcohol was pre-specified for the exclusion sensitivity analysis. After the
-# cohort restriction its missingness sits near the 30% Tier B/C boundary, so it
-# is kept in the sensitivity analysis regardless of tier. Set to [] to make the
-# sensitivity analysis purely tier-driven.
+# Variables to force into the Tier C exclusion sensitivity analysis regardless of
+# tier. Empty in the revised analysis, so the sensitivity analysis is purely
+# tier-driven (and, with no Tier C variables, not run).
 FORCE_SENSITIVITY_VARS = []
 tier_c_vars = sorted(set(tier_c_vars) | set(FORCE_SENSITIVITY_VARS))
 
@@ -1154,7 +1173,9 @@ for i in range(N_MC):
     if T.sum() < 5 or T.sum() == len(T):
         continue
     pba_results.append({
-        "iteration": i + 1, "sensitivity": se, "specificity": sp,
+        # Sampled self-report parameters use distinct names so that the model's
+        # threshold metrics below ("specificity", "recall") cannot overwrite them.
+        "iteration": i + 1, "se_selfreport": se, "sp_selfreport": sp,
         "implied_true_prevalence": pi_s.mean(),
         "frac_scores_pi_clipped_zero": np.mean(pi_s == 0),
         "auroc": roc_auc_score(T, s_hold),
@@ -1390,6 +1411,8 @@ else:
 # 9. FINAL SUMMARY
 # ==============================================================================
 
+tierc_line = ("\n    sensitivity_no_tierc_results.csv           (Tier C sensitivity)"
+              if tier_c_vars else "")
 print("\n" + "=" * 70)
 print("MODELING COMPLETE")
 print("=" * 70)
@@ -1418,11 +1441,10 @@ Outputs (all figures in .png, .pdf, .svg):
     holdout_predictions.csv                    (holdout predicted probabilities)
     cv_results.csv                             (per-fold CV metrics)
     autogluon_leaderboard.csv                  (model ensemble details)
-    ensemble_weights.csv                       (weighted ensemble composition)
+    ensemble_weights.csv                       (weighted ensemble composition, if extractable)
     shap_importance.csv                        (SHAP feature rankings)
     monte_carlo_misclassification.csv          (bias analysis iterations)
-    bias_analysis_summary.csv                  (bias analysis median and 95% SI)
-    sensitivity_no_tierc_results.csv           (Tier C sensitivity)
+    bias_analysis_summary.csv                  (bias analysis median and 95% SI){tierc_line}
 
   Figures:
     fig_calibration_holdout                    (calibration / reliability diagram)
